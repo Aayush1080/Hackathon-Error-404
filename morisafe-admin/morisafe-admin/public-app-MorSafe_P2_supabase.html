@@ -1,0 +1,1476 @@
+<!doctype html>
+<!--
+  MoriSafe - single-file hazard alert & reporting app for Mauritius.
+
+  FILE MAP
+    CSS       1 Theme · 2 Accessibility · 3 Layout · 4 Components · 5 Maps · 6 Camera · 7 Filters
+    JS        1 Helpers · 2 Encryption · 3 Storage · 4 State · 5 Translations · 6 Geocoding
+              7 Incident rules · 8 Screens (Alerts, Map, Report, Contacts, Profile, Reviewer)
+              9 Rendering · 10 Photo capture · 11 Location · 12 Report submit · 13 Events · 14 Start-up
+
+  Needs ./leaflet/leaflet.{js,css} and ./icon-192.png next to this file.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#14233a" />
+    <link rel="icon" href="icon-192.png" />
+    <link rel="stylesheet" href="leaflet/leaflet.css" />
+    <script src="leaflet/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+    <title>MoriSafe</title>
+    <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet" />
+    <style>
+/* ==========================================================
+   1. THEME
+   Colour variables. Light by default; dark via OS setting or data-theme.
+   ========================================================== */
+:root{--ink:#14233a;--bg:#f7f1e6;--card:#fffdf8;--line:#d9cfba;--teal:#0b6e78;--tealbg:#dcf0ee;--amber:#8a5a00;--amberbg:#fdebc4;--red:#a8200f;--redbg:#fbdcd6;--green:#2f6b3f;--greenbg:#dcefdc;--mut:#4d5b70;--sz:16px;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--ink:#eef2f7;--bg:#0f1a2b;--card:#172538;--line:#2e4059;--teal:#5fd0d9;--tealbg:#12383d;--amber:#f5c46a;--amberbg:#3d2f10;--red:#ff9a8a;--redbg:#4a1d17;--green:#8fd29d;--greenbg:#1a3a24;--mut:#aab8cc}}
+:root[data-theme="dark"]{--ink:#eef2f7;--bg:#0f1a2b;--card:#172538;--line:#2e4059;--teal:#5fd0d9;--tealbg:#12383d;--amber:#f5c46a;--amberbg:#3d2f10;--red:#ff9a8a;--redbg:#4a1d17;--green:#8fd29d;--greenbg:#1a3a24;--mut:#aab8cc}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:var(--sz)/1.45 "Atkinson Hyperlegible",system-ui,sans-serif}
+/* ==========================================================
+   2. ACCESSIBILITY MODES
+   High-contrast (.hc) and large-text (.lg) body classes, focus ring.
+   ========================================================== */
+body.hc{--line:var(--ink);--mut:var(--ink)}body.hc .card{border-width:2px}
+body.lg{--sz:19px}
+button,select,input,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:3px solid var(--teal);outline-offset:2px}
+/* ==========================================================
+   3. PAGE LAYOUT
+   Workspace switcher, phone frame, scroll area, bottom nav.
+   ========================================================== */
+.top{display:flex;gap:8px;justify-content:center;padding:12px;flex-wrap:wrap}
+.seg{display:flex;border:2px solid var(--ink);border-radius:999px;overflow:hidden}
+.seg button{border:0;background:transparent;padding:10px 18px;min-height:44px;font-weight:700}
+.seg button[aria-pressed=true]{background:var(--ink);color:var(--bg)}
+.wrap{display:flex;justify-content:center;padding:0 12px 24px}
+.phone{width:100%;max-width:420px;min-height:760px;background:var(--bg);border:2px solid var(--ink);border-radius:28px;display:flex;flex-direction:column;overflow:hidden;position:relative}
+.scr{flex:1;overflow:auto;padding:14px 16px 20px;position:relative;background:radial-gradient(circle at 110% -5%,transparent 0 60px,var(--line) 61px 62px,transparent 63px 80px,var(--line) 81px 82px,transparent 83px) no-repeat}
+.nav{display:grid;grid-template-columns:repeat(5,1fr);border-top:2px solid var(--ink);background:var(--card)}
+.nav button{border:0;background:none;padding:8px 2px;min-height:58px;font-size:.8rem;display:flex;flex-direction:column;align-items:center;gap:2px}
+.nav button[aria-current=page]{font-weight:700;color:var(--teal);box-shadow:inset 0 3px 0 var(--teal)}
+/* ==========================================================
+   4. COMPONENTS
+   Headings, cards, badges, notices, buttons, form fields, chips, toast.
+   ========================================================== */
+h1{font-size:1.5rem;margin:0}h2{font-size:1.2rem;margin:16px 0 8px}h3{margin:0 0 4px;font-size:1.05rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin:10px 0;box-shadow:0 1px 3px rgba(20,35,58,.08)}
+.badge{display:inline-flex;align-items:center;gap:4px;font-weight:700;font-size:.82rem;padding:3px 9px;border-radius:8px;border:2px solid currentColor;margin:0 6px 6px 0}
+.b-urg{color:var(--red);background:var(--redbg)}.b-warn{color:var(--amber);background:var(--amberbg)}.b-info{color:var(--teal);background:var(--tealbg)}.b-ver{color:var(--green);background:var(--greenbg)}
+.b-com{color:var(--ink);background:transparent;border-style:dashed}.b-spo{color:var(--mut);background:var(--card);border-style:dotted}
+.notice{background:var(--amberbg);color:var(--ink);border-left:6px solid var(--amber);border-radius:10px;padding:10px 12px;font-size:.9rem}.emergency{background:var(--redbg);border-left-color:var(--red);color:var(--red);font-weight:700;text-transform:uppercase;letter-spacing:.02em}
+.meta{color:var(--mut);font-size:.88rem}
+.btn{display:block;width:100%;min-height:52px;border-radius:14px;border:2px solid var(--ink);background:var(--card);font-weight:700;padding:10px 14px;margin:8px 0}
+.btn.p{background:var(--teal);border-color:var(--teal);color:#fff}
+.btn.d{background:var(--red);border-color:var(--red);color:#fff}
+.btn.s{display:inline-block;width:auto;min-height:44px;font-size:.9rem}
+.link{background:none;border:0;color:var(--teal);text-decoration:underline;min-height:44px;font-weight:700;padding:0}
+label{display:block;font-weight:700;margin:12px 0 4px}
+input[type=text],input[type=time],input[type=tel],select,textarea{width:100%;min-height:48px;border:2px solid var(--line);border-radius:12px;background:var(--card);padding:8px 10px}
+.phone-field{display:flex;align-items:stretch;gap:0}.phone-prefix{display:flex;align-items:center;padding:8px 11px;border:2px solid var(--line);border-right:0;border-radius:12px 0 0 12px;background:#fff;color:#000;font-weight:700}.phone-field input{min-width:0;border-radius:0 12px 12px 0!important;color:#000!important;background:#fff!important}
+.chk{display:flex;gap:10px;align-items:center;min-height:48px;font-weight:400;margin:0}
+.chk input{width:24px;height:24px;flex:none}
+.chips{display:flex;flex-wrap:wrap;gap:8px}.chips button{min-height:46px;border:2px solid var(--line);border-radius:12px;background:var(--card);padding:6px 12px}.chips button[aria-pressed=true]{border-color:var(--teal);background:var(--tealbg);font-weight:700}
+ol,ul{padding-left:22px;margin:6px 0}li{margin:4px 0}
+.toast{position:absolute;left:16px;right:16px;bottom:12px;background:var(--ink);color:var(--bg);padding:12px;border-radius:12px;z-index:5}
+.ops{max-width:1100px;width:100%}
+.grid{display:grid;grid-template-columns:300px 1fr;gap:14px}
+@media(max-width:800px){.grid{grid-template-columns:1fr}}
+.q{width:100%;text-align:left;border:2px solid var(--line);background:var(--card);border-radius:12px;padding:10px;margin:6px 0;min-height:56px}
+.q[aria-pressed=true]{border-color:var(--teal);background:var(--tealbg)}
+.ai{border:2px dashed var(--teal);border-radius:12px;padding:12px;background:var(--tealbg)}
+table{width:100%;border-collapse:collapse;font-size:.9rem}td{padding:6px;border-top:1px solid var(--line)}
+svg text{fill:var(--ink);font-family:inherit}
+/* ==========================================================
+   5. MAPS
+   Leaflet containers and pin styles (text pins, photo pins, dimmed old pins).
+   ========================================================== */
+#map,#report-map,#review-map{height:320px;border-radius:12px;border:1px solid var(--line);position:relative;z-index:0;isolation:isolate;margin:8px 0}#report-map,#review-map{height:240px}.pin{background:var(--card);color:var(--ink);border:2px solid var(--ink);border-radius:8px;padding:2px 6px;font-size:.75rem;font-weight:700;white-space:nowrap;transform:translate(-50%,-100%);width:max-content}.pin-c{border-style:dashed}.pin-n{border-color:var(--teal);color:var(--teal);box-shadow:0 0 0 2px var(--card)}.pin-old{opacity:.45;filter:grayscale(75%)}.photo-pin{width:46px;height:46px;border:3px solid var(--teal);border-radius:50%;overflow:hidden;background:var(--card);transform:translate(-50%,-100%)}.photo-pin img{width:100%;height:100%;object-fit:cover;display:block}.photo-pin.pin-old{border-color:var(--mut)}.leg span{display:inline-flex;align-items:center;gap:6px;margin-right:12px;font-size:.85rem}
+/* ==========================================================
+   6. CAMERA, PHOTOS & OVERLAYS
+   Live camera panel, incident photos, photo modal, filter drawer shell.
+   ========================================================== */
+.camera-panel{margin:10px 0;padding:10px;background:#000;border-radius:14px}.camera-panel video{display:block;width:100%;max-height:280px;object-fit:cover;border-radius:9px;background:#111}.camera-actions{display:flex;gap:8px;margin-top:8px}.camera-actions .btn{margin:0}.incident-photo{display:block;max-width:100%;max-height:150px;border-radius:8px;margin-top:7px}.photo-modal{position:absolute;inset:0;z-index:10;background:rgba(0,0,0,.86);padding:16px;display:flex;flex-direction:column;justify-content:center;align-items:center}.photo-modal img{max-width:100%;max-height:78vh;border-radius:12px}.photo-modal .btn{max-width:220px;margin-top:12px}
+.nav{grid-template-columns:repeat(5,1fr)}.drawer{position:absolute;top:0;bottom:0;left:0;width:92%;background:var(--card);border-right:2px solid var(--ink);z-index:6;padding:14px;overflow:auto}.scrim{position:absolute;inset:0;background:rgba(0,0,0,.45);border:0;z-index:5}.avatar{width:84px;height:84px;border-radius:50%;background:var(--teal);color:#fff;display:flex;align-items:center;justify-content:center;font-size:2rem;font-weight:700;margin:0 auto 8px}
+/* ==========================================================
+   7. ALERT FILTERS & CONTACTS
+   Two-column helpers, filter drawer columns (.fcols), filter bar, contact rows.
+   ========================================================== */
+.cols2,.chips.cols2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.cols2>button,.chips.cols2>button{margin:0;width:100%;text-align:left}
+.fcols{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start}.fcols .col{display:flex;flex-direction:column;gap:6px;min-width:0}.fcols .q{font-size:.85rem;padding:6px 8px;text-align:left}
+.fbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0 4px}.fbar .btn{margin:0}
+.btn.s[aria-pressed=true]{background:var(--teal);border-color:var(--teal);color:#fff}
+.contact{display:flex;justify-content:space-between;align-items:center;gap:12px;min-height:56px;color:var(--ink);text-decoration:none}
+.contact .cname{font-weight:700}.contact .cnum{font-weight:700;font-size:1.1rem;color:var(--teal);white-space:nowrap}
+</style>
+  </head>
+  <body>
+    <!-- Workspace switcher: public app vs reviewer view -->
+    <div class="top">
+      <div class="seg" role="group" aria-label="Workspace">
+        <button id="appb" aria-pressed="true">Public app</button><button id="reviewb" aria-pressed="false">Review reports</button>
+      </div>
+    </div>
+    <!-- App root: everything below is rendered into #root by draw() -->
+    <div class="wrap" id="root"></div>
+    <script>
+      /* ============================================================
+         1. HELPERS
+         $ = querySelector, esc/un = HTML escape/unescape, TOWNS, EVS (incident types), OTHER.
+         ============================================================ */
+      const $ = (s) => document.querySelector(s);
+      const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+      const un = (x) => {
+        const t = document.createElement("textarea");
+        t.innerHTML = x;
+        return t.value;
+      };
+      const now = () => {
+        const d = new Date();
+        return d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0");
+      };
+      const TOWNS = [
+        "Port Louis",
+        "Curepipe",
+        "Quatre Bornes",
+        "Vacoas-Phoenix",
+        "Rose Hill",
+        "Beau Bassin",
+        "Mahébourg",
+        "Flic en Flac",
+        "Grand Baie",
+        "Triolet",
+        "Goodlands",
+        "Moka",
+        "Centre de Flacq",
+        "Saint Pierre",
+        "Souillac",
+        "Other",
+      ];
+      const EVS = ["Falling debris", "Accident", "Fire", "Flooding"];
+      const OTHER = "Other";
+      const norm = (s) =>
+        String(s)
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toLowerCase();
+      const matchTown = (n) => {
+        if (!n) return "";
+        const x = norm(n);
+        return TOWNS.find((t) => t !== "Other" && (norm(t).includes(x) || x.includes(norm(t)))) || "";
+      };
+      /* ============================================================
+         2. ENCRYPTION
+         AES-256-GCM via Web Crypto. relay() simulates the encrypted hop to the reviewer side.
+         ============================================================ */
+      const enc = new TextEncoder(),
+        dec = new TextDecoder();
+      const b64 = (u) => {
+        u = new Uint8Array(u);
+        let s = "";
+        for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode.apply(null, u.subarray(i, i + 8192));
+        return btoa(s);
+      };
+      const ub = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+      const sha = async (s) => b64(await crypto.subtle.digest("SHA-256", enc.encode(s.trim().toLowerCase())));
+      const derive = async (pass, salt) => {
+        const k = await crypto.subtle.importKey("raw", enc.encode(pass), "PBKDF2", false, ["deriveKey"]);
+        return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 200000, hash: "SHA-256" }, k, { name: "AES-GCM", length: 256 }, false, [
+          "encrypt",
+          "decrypt",
+        ]);
+      };
+      const seal = async (key, o) => {
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        return { iv: b64(iv), ct: b64(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(o)))) };
+      };
+      const open = async (key, b) => JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: ub(b.iv) }, key, ub(b.ct))));
+      const CK = crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+      const relay = async (o) => {
+        const k = await CK,
+          box = await seal(k, o);
+        S.bus.push(box.ct.length);
+        return open(k, box);
+      }; /* encrypted before it reaches the operator side */
+      /* ============================================================
+         3. STORAGE
+         Device key kept in IndexedDB; profile, pins and reports saved encrypted in localStorage.
+         ============================================================ */
+      const idb = () =>
+        new Promise((res, rej) => {
+          const r = indexedDB.open("morisafe", 1);
+          r.onupgradeneeded = () => r.result.createObjectStore("k");
+          r.onsuccess = () => res(r.result);
+          r.onerror = () => rej(r.error);
+        });
+      const kv = async (m, k, v) => {
+        const db = await idb();
+        return new Promise((res, rej) => {
+          const o = db.transaction("k", m === "get" ? "readonly" : "readwrite").objectStore("k"),
+            q = m === "get" ? o.get(k) : o.put(v, k);
+          q.onsuccess = () => res(q.result);
+          q.onerror = () => rej(q.error);
+        });
+      };
+      async function devKey() {
+        try {
+          let k = await kv("get", "dk");
+          if (!k) {
+            k = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+            await kv("put", "dk", k);
+          }
+          return k;
+        } catch (e) {
+          return null;
+        }
+      }
+      const persist = async () => {
+        try {
+          const k = await devKey();
+          if (!k) return;
+          localStorage.setItem("morisafe_d", JSON.stringify(await seal(k, { p: S.user, pins: S.pins, r: S.reports })));
+        } catch (e) {}
+      };
+      async function loadSaved() {
+        try {
+          const k = await devKey(),
+            raw = localStorage.getItem("morisafe_d");
+          if (!k || !raw) return;
+          const d = await open(k, JSON.parse(raw));
+          S.user = Object.assign(S.user, d.p);
+          S.pins = d.pins || [];
+          S.reports = d.r || [];
+          S.nid = Math.max(1, ...S.reports.map((r) => Number(r.id) || 0)) + 1;
+          draw();
+        } catch (e) {}
+      }
+      /* ============================================================
+         4. STATE
+         Single global object S. UI is re-rendered from it by draw().
+         pref.n10 = only notify within NEAR_KM (default false = all Mauritius)
+         locState  = report auto-location: idle | busy | ok | fail
+         ============================================================ */
+      const S = {
+        view: "app",
+        tab: "alerts",
+        au: "in",
+        toast: "",
+        cat: "Flooding",
+        sent: false,
+        sending: false,
+        busy: false,
+        aerr: "",
+        showOff: true,
+        showCom: true,
+        drawer: false,
+        near: "all",
+        closestId: null,
+        camera: false,
+        locating: false,
+        alertNear: false,
+        rerr: "",
+        geoHint: "",
+        locState: "idle",
+        user: {
+          name: "",
+          email: "",
+          phone: "",
+          town: "Not set",
+          pref: { lang: "English", n: { u: true, w: true, i: false }, n10: false, loc: "Ask each time" },
+        },
+        pins: [],
+        alerts: [],
+        reports: [],
+        audit: [],
+        bus: [],
+        f: {},
+        fl: { town: "All", ev: "All" },
+        editId: null,
+        editPos: null,
+        photoView: null,
+        sel: null,
+        nid: 1,
+        photo: null,
+        repPos: null,
+        mv: { c: [-20.2, 57.55], z: 10 },
+        addMode: false,
+        draft: null,
+        me: null,
+      };
+      /* ============================================================
+         5. TRANSLATIONS
+         English / Français / Kreol Morisien strings; t(key) looks them up.
+         ============================================================ */
+      const LANG = {
+        English: {
+          app: "Public app",
+          review: "Review reports",
+          alerts: "Alerts",
+          map: "Map",
+          report: "Report",
+          contacts: "Contacts",
+          profile: "Profile",
+          allMauritius: "All Mauritius",
+          within: "Within {km} km",
+          closest: "Find closest incident",
+          you: "You",
+          mapTitle: "Map",
+          mapIntro: "Current approved civilian incidents in Mauritius. Tap an incident for its details.",
+          findNear: "Find incidents near you",
+          reportHazard: "Report a hazard",
+          emergency: "IMMEDIATE DANGER? CONTACT THE APPROPRIATE EMERGENCY SERVICE DIRECTLY. DO NOT WAIT FOR THIS REPORT TO BE REVIEWED.",
+          what: "What are you reporting?",
+          location: "Location",
+          useLocation: "Use my location",
+          locationMap: "Location on map",
+          mapHelp: "Tap the map to select the report location in Mauritius.",
+          observed: "Time observed",
+          description: "Short description (optional)",
+          photo: "Photo (required)",
+          take: "Take photo",
+          choose: "Choose photo",
+          send: "Send for review",
+          reviewTitle: "Review reports",
+          reviewIntro: "Approved reports appear on the public map and alerts for 20 hours.",
+          edit: "Edit",
+          delete: "Delete",
+          save: "Save changes",
+          cancel: "Cancel",
+          contactsTitle: "Emergency contacts",
+          contactsHelp: "Tap a contact to open your phone app with the number ready to call.",
+        },
+        Français: {
+          app: "Application publique",
+          review: "Réviser les signalements",
+          alerts: "Alertes",
+          map: "Carte",
+          report: "Signaler",
+          contacts: "Contacts",
+          profile: "Profil",
+          allMauritius: "Toute l’île Maurice",
+          within: "Dans un rayon de {km} km",
+          closest: "Trouver l’incident le plus proche",
+          you: "Vous",
+          mapTitle: "Carte",
+          mapIntro: "Incidents civils approuvés à Maurice. Touchez un incident pour voir les détails.",
+          findNear: "Trouver des incidents près de vous",
+          reportHazard: "Signaler un danger",
+          emergency: "DANGER IMMÉDIAT ? CONTACTEZ DIRECTEMENT LE SERVICE D’URGENCE APPROPRIÉ. N’ATTENDEZ PAS LA RÉVISION DU SIGNALEMENT.",
+          what: "Que signalez-vous ?",
+          location: "Lieu",
+          useLocation: "Utiliser ma position",
+          locationMap: "Lieu sur la carte",
+          mapHelp: "Touchez la carte pour choisir le lieu du signalement à Maurice.",
+          observed: "Heure observée",
+          description: "Brève description (facultatif)",
+          photo: "Photo (obligatoire)",
+          take: "Prendre une photo",
+          choose: "Choisir une photo",
+          send: "Envoyer pour révision",
+          reviewTitle: "Réviser les signalements",
+          reviewIntro: "Les signalements approuvés apparaissent sur la carte et dans les alertes pendant 20 heures.",
+          edit: "Modifier",
+          delete: "Supprimer",
+          save: "Enregistrer",
+          cancel: "Annuler",
+          contactsTitle: "Contacts d’urgence",
+          contactsHelp: "Touchez un contact pour ouvrir votre application téléphone avec le numéro prêt à appeler.",
+        },
+        "Kreol Morisien": {
+          app: "Aplikasyon piblik",
+          review: "Reviz rapor",
+          alerts: "Alert",
+          map: "Kart",
+          report: "Raport",
+          contacts: "Kontak",
+          profile: "Profil",
+          allMauritius: "Tou Moris",
+          within: "Dan enn reyon {km} km",
+          closest: "Rod linisidan pli pre",
+          you: "Ou",
+          mapTitle: "Kart",
+          mapIntro: "Linisidan sivil aprouve dan Moris. Tous enn linisidan pou get so detay.",
+          findNear: "Rod linisidan pre ar ou",
+          reportHazard: "Raport enn danze",
+          emergency: "DANZE IMEDYA ? KONTAKTE SERVIS DIRZANS DIREKT. PA ATANN REVIZYON RAPOR LA.",
+          what: "Ki ou pe raporte ?",
+          location: "Landrwa",
+          useLocation: "Servi mo landrwa",
+          locationMap: "Landrwa lor kart",
+          mapHelp: "Tous kart la pou swazir landrwa rapor dan Moris.",
+          observed: "Ler obzerve",
+          description: "Deskripsyon kourt (opsyonel)",
+          photo: "Foto (obligatwar)",
+          take: "Pran enn foto",
+          choose: "Swazir enn foto",
+          send: "Avoy pou revizyon",
+          reviewTitle: "Reviz rapor",
+          reviewIntro: "Rapor aprouve paret lor kart ek dan alert pandan 20 er.",
+          edit: "Modifye",
+          delete: "Efase",
+          save: "Anrezistre",
+          cancel: "Anile",
+          contactsTitle: "Kontak dirzans",
+          contactsHelp: "Tous enn kontak pou ouver aplikasyon telefonn avek nimero pare pou apele.",
+        },
+      };
+      const t = (key, vars = {}) =>
+        String((LANG[S.user.pref.lang] || LANG.English)[key] || LANG.English[key] || key).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
+      function syncLanguage() {
+        const app = $("#appb"),
+          review = $("#reviewb");
+        if (app) app.textContent = t("app");
+        if (review) review.textContent = t("review");
+        document.documentElement.lang = S.user.pref.lang === "Français" ? "fr" : S.user.pref.lang === "Kreol Morisien" ? "mfe" : "en";
+      }
+      /* ============================================================
+         5b. SMALL UI HELPERS
+         ============================================================ */
+      const badge = (c, t, i = "") => `<span class="badge ${c}"><span aria-hidden="true">${i}</span>${t}</span>`;
+      const SEV = (a) => (a.status === "Ended" ? badge("b-info", "INFORMATION", "ℹ") : badge("b-urg", "URGENT", "⚠"));
+      /* ============================================================
+         6. REVERSE GEOCODING
+         Coordinates -> place name (Nominatim, falls back to BigDataCloud, then raw coords).
+         ============================================================ */
+      async function revgeo(lat, lng) {
+        try {
+          const r = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&accept-language=en&lat=${lat}&lon=${lng}`,
+          );
+          if (!r.ok) throw 0;
+          const a = (await r.json()).address || {};
+          const town = a.city || a.town || a.village || a.municipality || a.suburb || "";
+          const place = [a.road || a.pedestrian || a.footway, a.neighbourhood || a.suburb || a.hamlet, town]
+            .filter((x, i, l) => x && l.indexOf(x) === i)
+            .join(", ");
+          if (place) return { place, town: matchTown(town) || matchTown(a.suburb || a.county || "") || "Other" };
+        } catch (e) {}
+        try {
+          const j = await (
+            await fetch(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`)
+          ).json();
+          const place = [j.locality, j.city].filter((x, i, l) => x && l.indexOf(x) === i).join(", ");
+          if (place) return { place, town: matchTown(j.city || j.locality || "") || "Other" };
+        } catch (e) {}
+        return { place: lat.toFixed(5) + ", " + lng.toFixed(5), town: "Other" };
+      }
+      /* ============================================================
+         7. INCIDENT RULES
+         Time windows, Mauritius bounds, distance, duplicate check, filters, notifications.
+         NEAR_KM (10 km) drives both the Alerts "Within" button and the Profile notification option.
+         ============================================================ */
+      const HOUR = 60 * 60 * 1000,
+        CURRENT_FOR = 20 * HOUR,
+        DIM_AFTER = 12 * HOUR;
+      const reportAge = (r) => Math.max(0, Date.now() - Number(r.publishedAt || 0));
+      const currentReports = () => S.reports.filter((r) => r.published && Number(r.publishedAt) > 0 && reportAge(r) < CURRENT_FOR);
+      const isDim = (r) => reportAge(r) >= DIM_AFTER;
+      // Alerts list = current reports passing town, type ("Other" = any custom type) and optional radius filters.
+      const visible = () =>
+        currentReports().filter(
+          (r) =>
+            (S.fl.town === "All" || r.town === S.fl.town) &&
+            (S.fl.ev === "All" || (S.fl.ev === OTHER ? !EVS.includes(r.cat) : r.cat === S.fl.ev)) &&
+            (!S.alertNear || !S.me || distanceKm(S.me, { lat: Number(r.lat), lng: Number(r.lng) }) <= NEAR_KM),
+        );
+      const inMauritius = (lat, lng) => {
+        lat = Number(lat);
+        lng = Number(lng);
+        return Number.isFinite(lat) && Number.isFinite(lng) && lat >= -20.65 && lat <= -19.85 && lng >= 57.18 && lng <= 58.1;
+      };
+      const distanceKm = (a, b) => {
+        const r = Math.PI / 180,
+          lat1 = a.lat * r,
+          lat2 = b.lat * r,
+          dlat = (b.lat - a.lat) * r,
+          dlng = (b.lng - a.lng) * r,
+          h = Math.sin(dlat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dlng / 2) ** 2;
+        return 6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+      };
+      const NEAR_KM = 10,
+        DUP_KM = 0.5;
+      /* an already-approved, still-current incident of the same type within 500 m */
+      function findDuplicate(cat, pos) {
+        return currentReports().find(
+          (r) => r.cat === cat && inMauritius(r.lat, r.lng) && distanceKm(pos, { lat: Number(r.lat), lng: Number(r.lng) }) <= DUP_KM,
+        );
+      }
+      /* default: notify about all of Mauritius; Profile can limit it to NEAR_KM (10 km) of the user */
+      // Notify about all of Mauritius unless the user chose "only within NEAR_KM" in Profile.
+      function shouldNotify(r) {
+        if (!S.user.pref.n10) return true;
+        return !!(S.me && inMauritius(r.lat, r.lng) && distanceKm(S.me, { lat: Number(r.lat), lng: Number(r.lng) }) <= NEAR_KM);
+      }
+      function notifyIncident(r) {
+        if (!shouldNotify(r)) return "";
+        const msg = r.cat + " reported near " + un(r.area || r.town || "you");
+        try {
+          if ("Notification" in window && Notification.permission === "granted") new Notification("MoriSafe", { body: msg });
+        } catch (e) {}
+        return msg;
+      }
+      function allIncidents() {
+        return currentReports()
+          .filter((r) => inMauritius(r.lat, r.lng))
+          .map((r) => ({
+            id: "report-" + r.id,
+            rid: r.id,
+            kind: "civilian",
+            cat: r.cat,
+            area: un(r.area),
+            town: r.town,
+            lat: Number(r.lat),
+            lng: Number(r.lng),
+            time: r.time,
+            details: r.desc,
+            photo: r.photo,
+            dim: isDim(r),
+          }));
+      }
+      function mapIncidents() {
+        let xs = allIncidents();
+        if (S.near !== "all" && S.me) xs = xs.filter((x) => distanceKm(S.me, x) <= Number(S.near));
+        return xs;
+      }
+      /* ============================================================
+         8a. SCREEN: ALERTS
+         Incident cards, the Alerts tab and the two-column filter drawer.
+         ============================================================ */
+      function alertCard(r) {
+        const dim = isDim(r),
+          photo = r.photo && okImg(r.photo) ? `<img class="incident-photo" src="${r.photo}" alt="Attached incident photo">` : "";
+        return `<div class="card" style="border:3px solid var(--red);${dim ? "opacity:.48" : ""}"><div>${badge("b-com", "CIVILIAN INCIDENT", "?")}${dim ? badge("b-spo", "OVER 12 HOURS OLD", "◷") : ""}</div>
+<h3>${esc(r.cat)} · ${esc(un(r.area || r.town || "Mauritius"))}</h3><div class="meta">${esc(r.town || "Mauritius")} · Reported ${esc(r.time || "Time not given")}</div>
+${r.desc ? `<p style="white-space:pre-line">${esc(r.desc)}</p>` : ""}${photo}<button class="btn s" data-a="seemap" data-id="${r.id}">View on map</button></div>`;
+      }
+      function Alerts() {
+        const v = visible(),
+          act = v.length,
+          nf = (S.fl.town !== "All") + (S.fl.ev !== "All");
+        return `<h1>MoriSafe</h1>
+<div class="fbar"><button class="btn s" data-a="filters">☰ Filters${nf ? " (" + nf + ")" : ""}</button><button class="btn s" data-a="near4" aria-pressed="${S.alertNear}">📍 Within ${NEAR_KM} km</button></div><div class="meta">${S.fl.town} · ${S.fl.ev}${S.alertNear ? " · Within " + NEAR_KM + " km of you" : ""}</div>
+<h2 style="color:${act ? "var(--red)" : "var(--green)"}">${act ? act + " current incident" + (act > 1 ? "s" : "") + " in your selection" : "No current incident in your selection"}</h2>
+${v.length ? v.map(alertCard).join("") : `<p>No current incidents match these filters.</p>`}`;
+      }
+      // Filter drawer: Location and Type of incident side by side (.fcols).
+      function Drawer() {
+        const L = (arr, k, key) =>
+          arr.map((x) => `<button class="q" ${key}="${x}" aria-pressed="${S.fl[k] === x}" style="min-height:44px;margin:0">${x}</button>`).join("");
+        return `<button class="scrim" data-a="fclose" aria-label="Close filters"></button><aside class="drawer" aria-label="Filters"><div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">Filters</h2><button class="btn s" data-a="fclose">Done</button></div>
+<div class="fcols" style="margin-top:12px"><div class="col"><h3>Location</h3>${L(["All", ...TOWNS], "town", "data-ft")}</div><div class="col"><h3>Type of incident</h3>${L(["All", ...EVS, OTHER], "ev", "data-fe")}</div></div></aside>`;
+      }
+      /* ============================================================
+         8b. SCREEN: MAP
+         Radius chips, "find closest", legend; Leaflet is initialised by initMap().
+         ============================================================ */
+      function MapS() {
+        const near = S.near,
+          inc = mapIncidents();
+        return `<h1>Map</h1><div class="meta">Current approved civilian incidents in Mauritius. Tap an incident for its details.</div>
+<div class="card"><h3>Find incidents near you</h3><div class="chips" role="group"><button data-near="all" aria-pressed="${near === "all"}">All Mauritius</button>${[5, 10].map((k) => `<button data-near="${k}" aria-pressed="${near === k}">Within ${k} km</button>`).join("")}</div><button class="btn s" data-a="closest">Find closest incident</button>${S.me ? `<div class="meta">● You${near === "all" ? "" : " · Showing a " + near + " km radius around you."}</div>` : `<div class="meta">${S.locating ? "Finding your current location…" : "Your current location will appear as “You” when location access is available."}</div>`}</div>
+<div id="map" role="application" aria-label="Current approved incidents in Mauritius"></div>
+<div class="meta">${inc.length ? inc.length + " current incident" + (inc.length === 1 ? "" : "s") + " shown." : "No current incidents match these settings."} Map tiles need internet.</div>
+<div class="leg card"><span>● You</span><span>◷ Reported over 12 hours ago</span><span>★ Closest incident</span></div>${S.photoView ? `<div class="photo-modal" role="dialog" aria-label="Incident photo"><img src="${S.photoView}" alt="Incident photo"><button class="btn p" data-a="closephoto">Close photo</button></div>` : ""}`;
+      }
+      /* ============================================================
+         8c. LEAFLET MAP SETUP
+         initMap (public map), initReportMap (pick a location), initReviewMap (reviewer).
+         ============================================================ */
+      let MAPI = null,
+        REPORTMAP = null,
+        REVIEWMAP = null,
+        LOCATION_WATCH = null;
+      const ISLAND_BOUNDS = [
+        [-20.65, 57.18],
+        [-19.85, 58.1],
+      ];
+      function addMapTiles(map) {
+        L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", {
+          maxZoom: 19,
+          attribution: "Tiles © Esri",
+        }).addTo(map);
+      }
+      function ensureMapLocation() {
+        if (S.me || S.locating || LOCATION_WATCH !== null || !navigator.geolocation) return;
+        S.locating = true;
+        LOCATION_WATCH = navigator.geolocation.watchPosition(
+          (p) => {
+            const here = { lat: p.coords.latitude, lng: p.coords.longitude };
+            if (!inMauritius(here.lat, here.lng)) return;
+            const first = !S.me;
+            S.me = here;
+            S.locating = false;
+            if (first) S.mv = { c: [here.lat, here.lng], z: 14 };
+            if (first && S.view === "app" && (S.tab === "map" || S.tab === "report" || S.tab === "alerts")) draw();
+          },
+          () => {
+            S.locating = false;
+            LOCATION_WATCH = null;
+            if (S.view === "app" && (S.tab === "map" || S.tab === "report")) draw();
+          },
+          { enableHighAccuracy: true, maximumAge: 10000, timeout: 15000 },
+        );
+      }
+      function incidentPopup(i) {
+        const photo =
+          i.photo && okImg(i.photo)
+            ? `<button class="link" data-a="openphoto" data-rid="${i.rid}" aria-label="View attached incident photo"><img class="incident-photo" src="${i.photo}" alt="Incident photo"></button>`
+            : "";
+        return `<b>${esc(i.cat)}</b><br>${esc(i.area || i.town || "Mauritius")}<br><span class="meta">Approved civilian report${i.time ? " · " + esc(i.time) : ""}</span>${i.details ? `<p>${esc(i.details)}</p>` : ""}${photo}`;
+      }
+      function initMap() {
+        const el = document.getElementById("map");
+        if (MAPI) {
+          MAPI.remove();
+          MAPI = null;
+        }
+        if (!el) return;
+        if (typeof L === "undefined") {
+          el.innerHTML = '<p style="padding:12px">Map library did not load.</p>';
+          return;
+        }
+        const m = (MAPI = L.map(el, { maxBounds: ISLAND_BOUNDS, maxBoundsViscosity: 1, minZoom: 9 }).setView(S.mv.c, S.mv.z));
+        addMapTiles(m);
+        const ic = (i, closest) => {
+          const old = i.dim ? "pin-old" : "";
+          if (i.photo && okImg(i.photo))
+            return L.divIcon({
+              className: "",
+              html: `<div class="photo-pin ${old}" title="${esc(i.cat)}"><img src="${i.photo}" alt="${esc(i.cat)}"></div>`,
+              iconSize: [0, 0],
+            });
+          return L.divIcon({
+            className: "",
+            html: `<div class="pin pin-c ${old} ${closest ? "pin-n" : ""}">${closest ? "★ Closest · " : ""}${esc(i.cat)}</div>`,
+            iconSize: [0, 0],
+          });
+        };
+        mapIncidents().forEach((i) => {
+          const closest = i.id === S.closestId,
+            mark = L.marker([i.lat, i.lng], { icon: ic(i, closest) }).bindPopup(incidentPopup(i));
+          mark.addTo(m);
+          if (closest) mark.openPopup();
+        });
+        if (S.me)
+          L.circleMarker([S.me.lat, S.me.lng], { radius: 8, color: "#0b6e78", fillColor: "#0b6e78", fillOpacity: 1 })
+            .bindTooltip("You", { permanent: true, direction: "right" })
+            .addTo(m);
+        if (S.me && S.near !== "all") {
+          const radius = L.circle([S.me.lat, S.me.lng], {
+            radius: Number(S.near) * 1000,
+            color: "#0b6e78",
+            weight: 2,
+            dashArray: "6 5",
+            fillColor: "#0b6e78",
+            fillOpacity: 0.08,
+          })
+            .bindTooltip(`Within ${S.near} km of you`, { permanent: true, direction: "center" })
+            .addTo(m);
+          m.fitBounds(radius.getBounds(), { padding: [20, 20], maxZoom: 13 });
+        }
+        m.on("moveend", () => {
+          const c = m.getCenter();
+          S.mv = { c: [c.lat, c.lng], z: m.getZoom() };
+        });
+        ensureMapLocation();
+      }
+      // Report map. If auto-location failed and a last known position exists, a 1 km circle limits where taps are accepted.
+      function initReportMap() {
+        const el = document.getElementById("report-map");
+        if (REPORTMAP) {
+          REPORTMAP.remove();
+          REPORTMAP = null;
+        }
+        if (!el) return;
+        if (typeof L === "undefined") {
+          el.innerHTML = '<p style="padding:12px">Map library did not load.</p>';
+          return;
+        }
+        const p = S.repPos,
+          hasPoint = p && inMauritius(p.lat, p.lng),
+          fb = fbCircle(),
+          m = (REPORTMAP = L.map(el, { maxBounds: ISLAND_BOUNDS, maxBoundsViscosity: 1, minZoom: 9 }).setView(
+            hasPoint ? [p.lat, p.lng] : fb ? [S.me.lat, S.me.lng] : [-20.2, 57.55],
+            hasPoint ? 15 : fb ? 14 : 10,
+          ));
+        addMapTiles(m);
+        if (fb)
+          L.circle([S.me.lat, S.me.lng], {
+            radius: 1000,
+            color: "#0b6e78",
+            weight: 2,
+            dashArray: "6 5",
+            fillColor: "#0b6e78",
+            fillOpacity: 0.08,
+            interactive: false,
+          }).addTo(m);
+        if (hasPoint) L.marker([p.lat, p.lng]).addTo(m).bindPopup("Selected report location").openPopup();
+        if (S.me)
+          L.circleMarker([S.me.lat, S.me.lng], { radius: 8, color: "#0b6e78", fillColor: "#0b6e78", fillOpacity: 1 })
+            .bindTooltip("You", { permanent: true, direction: "right" })
+            .addTo(m);
+        m.on("click", async (e) => {
+          const d = { lat: e.latlng.lat, lng: e.latlng.lng, town: "Other" };
+          if (!inMauritius(d.lat, d.lng)) return toast("Choose a location in Mauritius.");
+          if (fbCircle() && distanceKm(S.me, d) > 1) return toast("Tap inside the dashed circle (within 1 km of your location).");
+          S.repPos = d;
+          S.f.rl = "";
+          S.rerr = "";
+          S.geoHint = "";
+          draw();
+          const g = await revgeo(d.lat, d.lng);
+          if (S.repPos === d) {
+            d.town = g.town;
+            S.f.rl = g.place;
+            draw();
+          }
+        });
+        ensureMapLocation();
+      }
+      // Reviewer map: shows every report and lets the reviewer re-position the one being edited.
+      function initReviewMap() {
+        const el = document.getElementById("review-map");
+        if (REVIEWMAP) {
+          REVIEWMAP.remove();
+          REVIEWMAP = null;
+        }
+        if (!el) return;
+        if (typeof L === "undefined") {
+          el.innerHTML = '<p style="padding:12px">Map library did not load.</p>';
+          return;
+        }
+        const editing = S.reports.find((r) => r.id == S.editId),
+          point =
+            S.editPos && inMauritius(S.editPos.lat, S.editPos.lng) ? S.editPos : editing && inMauritius(editing.lat, editing.lng) ? editing : null,
+          m = (REVIEWMAP = L.map(el, { maxBounds: ISLAND_BOUNDS, maxBoundsViscosity: 1, minZoom: 9 }).setView(
+            point ? [point.lat, point.lng] : [-20.2, 57.55],
+            point ? 15 : 10,
+          ));
+        addMapTiles(m);
+        S.reports
+          .filter((r) => inMauritius(r.lat, r.lng))
+          .forEach((r) =>
+            L.marker([r.lat, r.lng])
+              .addTo(m)
+              .bindPopup(`<b>${esc(r.cat)}</b><br>${esc(un(r.area || "Mauritius"))}<br>${r.published ? "Published" : "Pending review"}`),
+          );
+        if (point)
+          L.circleMarker([point.lat, point.lng], { radius: 9, color: "#0b6e78", fillColor: "#0b6e78", fillOpacity: 1 })
+            .bindTooltip("Editing location", { permanent: true, direction: "right" })
+            .addTo(m);
+        m.on("click", async (e) => {
+          if (!S.editId) return;
+          const d = { lat: e.latlng.lat, lng: e.latlng.lng, town: "Other" };
+          if (!inMauritius(d.lat, d.lng)) return toast("Choose a location in Mauritius.");
+          S.editPos = d;
+          draw();
+          const g = await revgeo(d.lat, d.lng);
+          if (S.editPos === d) {
+            d.town = g.town;
+            S.f.erl = g.place;
+            draw();
+          }
+        });
+      }
+      /* ============================================================
+         8d. SCREEN: REPORT
+         Type chips (+ "Other" free-text), location, map, time, description, photo.
+         ============================================================ */
+      function Report() {
+        if (S.sent)
+          return `<h1>Report received</h1><div class="card" style="border:2px solid var(--green)">${badge("b-ver", "SUCCESS", "✔")}<p><b>Report received for review. This is not an emergency service.</b></p><p class="meta">It is not public. It may be reviewed and you may be asked for more details.</p></div>
+<div class="notice emergency">In immediate danger? Contact the appropriate emergency service directly. Do not wait for this report to be reviewed.</div><button class="btn" data-a="anew">Back to alerts</button>`;
+        return `<h1>Report a hazard</h1><div class="notice emergency">Immediate danger? Contact the appropriate emergency service directly. Do not wait for this report to be reviewed.</div>
+<label>What are you reporting?</label><div class="chips cols2" role="group">${[...EVS, OTHER].map((c) => `<button data-cat="${c}" aria-pressed="${S.cat === c}">${c}</button>`).join("")}</div>
+${S.cat === OTHER ? `<label for="ro">Describe the incident</label><input type="text" id="ro" maxlength="60" value="${esc(S.f.ro || "")}" placeholder="Example: Fallen tree blocking the road">` : ""}
+<label for="rl">Location</label><input type="text" id="rl" value="${esc(S.f.rl || "")}" placeholder="Street, village or landmark"><button class="link" data-a="geo">Use my location</button>${S.locState === "busy" ? '<div class="meta" role="status">Finding your current location…</div>' : ""}${S.geoHint ? `<div class="notice" role="alert" style="margin:6px 0">${esc(S.geoHint)} ${fbCircle() ? "Tap inside the dashed 1 km circle on the map to choose the location." : "Tap the map below to choose the location manually."}</div>` : ""}
+<label>Location on map</label><div id="report-map" role="application" aria-label="Select the report location on the map"></div><div class="meta">${fbCircle() ? "Tap inside the dashed circle (1 km around your last known location) to select the report location." : "Tap the map to select the report location in Mauritius."}</div>
+<label for="rt">Time observed</label><input type="time" id="rt" value="${S.f.rt || now()}">
+<label for="rd">Short description (optional)</label><textarea id="rd" rows="3" placeholder="Example: Water across both lanes.">${esc(S.f.rd || "")}</textarea>
+<label>Photo (required)</label><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn s" data-a="cam">📷 Take photo</button><button class="btn s" data-a="gal">🖼 Choose photo</button>${S.photo ? '<button class="btn s" data-a="nophoto">Remove</button>' : ""}</div>
+${S.camera ? `<div class="camera-panel" role="dialog" aria-label="Camera"><video id="cam-video" autoplay playsinline muted></video><div class="camera-actions"><button class="btn p" data-a="takecapture">Capture photo</button><button class="btn" data-a="closecam">Cancel</button></div></div>` : ""}
+${S.photo ? `<img src="${S.photo}" alt="Attached photo preview" style="max-width:100%;border-radius:12px;margin-top:8px">` : ""}
+<p class="meta">🔒 Reports are encrypted (AES-256-GCM) before they are sent. Not public automatically; may be reviewed.</p>
+${S.rerr ? `<div class="notice" role="alert" style="margin-top:10px">${esc(S.rerr)}</div>` : ""}<button class="btn p" data-a="send">${S.sending ? "Sending…" : "Send for review"}</button>`;
+      }
+      /* ============================================================
+         8e. SCREEN: CONTACTS
+         ============================================================ */
+      const CONTACTS = [
+        ["Police", "999"],
+        ["SAMU – Public Ambulance", "144"],
+        ["Fire & Rescue Services", "115"],
+        ["Child Development Unit", "113"],
+        ["Family Protection Unit – Domestic Violence", "119"],
+        ["Crime Stoppers", "148"],
+        ["Police Information Room", "2080034"],
+        ["Police – Toll-free Complaints", "8002345"],
+        ["Family Protection Unit", "2102116"],
+        ["Brigade des Mineurs", "2134093"],
+        ["Tourist Police", "2131640"],
+        ["Police de l'Environnement", "2105151"],
+        ["Coast Guard", "2122747"],
+        ["Weather / Cyclone Information", "171"],
+      ];
+      function Contacts() {
+        return `<h1>Emergency contacts</h1><div class="notice emergency">IN IMMEDIATE DANGER? CALL AN EMERGENCY SERVICE NOW.</div><p class="meta">Tap a contact to open your phone app with the number ready to call.</p>${CONTACTS.map((c) => `<a class="card contact" href="tel:${c[1]}" aria-label="Call ${esc(c[0])} at ${c[1]}"><span class="cname">${esc(c[0])}</span><span class="cnum">${c[1]}</span></a>`).join("")}`;
+      }
+      /* ============================================================
+         8f. SCREEN: PROFILE
+         Details, language, notification options, location privacy, delete data.
+         ============================================================ */
+      function Profile() {
+        const u = S.user,
+          p = u.pref,
+          ini =
+            (u.name || "")
+              .split(/\s+/)
+              .filter(Boolean)
+              .map((x) => x[0])
+              .slice(0, 2)
+              .join("")
+              .toUpperCase() || "👤",
+          phone = String(u.phone || "")
+            .replace(/^\+230[\s-]?/, "")
+            .replace(/\D/g, "");
+        return `<h1>Profile</h1><div class="card" style="text-align:center"><div class="avatar" role="img" aria-label="Profile icon">${esc(ini)}</div><h3>${esc(u.name || "Guest")}</h3><div class="meta">Details are optional and stay on this device.</div></div>
+<div class="card"><label for="pfn">Full name</label><input type="text" id="pfn" autocomplete="name" value="${esc(u.name)}"><label for="pfe">Email</label><input type="text" id="pfe" inputmode="email" autocomplete="email" value="${esc(u.email)}"><label for="pfp">Phone number</label><div class="phone-field"><span class="phone-prefix" aria-hidden="true">+230</span><input type="tel" id="pfp" inputmode="numeric" autocomplete="tel-national" maxlength="8" value="${esc(phone)}" placeholder="1234 5678" aria-label="Phone number after country code +230"></div><label for="pft">Your area (main town, not your address)</label><select id="pft">${["Not set", ...TOWNS].map((t) => `<option ${t === u.town ? "selected" : ""}>${t}</option>`).join("")}</select><button class="btn p" data-a="saveprof">Save details</button><p class="meta">🔒 Saved encrypted (AES-256) on this device only.</p></div>
+<label>Language</label><select data-lang>${["English", "Français", "Kreol Morisien"].map((l) => `<option ${l === p.lang ? "selected" : ""}>${l}</option>`).join("")}</select><div class="meta">Translations are demo content, not professionally reviewed.</div>
+<label>Notify me about</label>${[
+          ["u", "Urgent"],
+          ["w", "Warning"],
+          ["i", "Information"],
+        ]
+          .map((n) => `<label class="chk"><input type="checkbox" data-n="${n[0]}" ${p.n[n[0]] ? "checked" : ""}>${n[1]}</label>`)
+          .join("")}
+<label>Notification area</label><div class="meta">By default you are notified about incidents anywhere in Mauritius. Turn this on to be notified only about incidents within ${NEAR_KM} km of your current location.</div><label class="chk"><input type="checkbox" data-n10 ${p.n10 ? "checked" : ""}>Only notify me within ${NEAR_KM} km of my location</label>
+<label>Location privacy</label><select data-loc>${["Ask each time", "Always allow", "Never share location"].map((l) => `<option ${l === p.loc ? "selected" : ""}>${l}</option>`).join("")}</select>
+<button class="btn d" data-a="wipe">Delete my saved data</button>`;
+      }
+      /* ============================================================
+         8g. SCREEN: REVIEWER & APP SHELL
+         Reviewer approves/edits/deletes reports; App() assembles the active screen + bottom nav.
+         ============================================================ */
+      const NAV = [
+        ["alerts", "🔔", "Alerts"],
+        ["map", "🗺", "Map"],
+        ["report", "✎", "Report"],
+        ["contacts", "☎", "Contacts"],
+        ["profile", "👤", "Profile"],
+      ];
+      function Reviewer() {
+        const reports = [...S.reports].sort((a, b) => Number(b.id) - Number(a.id)),
+          card = (r) => {
+            const photo =
+              r.photo && okImg(r.photo) ? `<img class="incident-photo" src="${r.photo}" alt="Submitted report photo">` : "";
+            const canPublish = inMauritius(r.lat, r.lng),
+              editing = S.editId == r.id;
+            if (editing) {
+              const ec = S.f.erc ?? r.cat,
+                el = S.f.erl ?? un(r.area || ""),
+                et = S.f.ert ?? r.time ?? "",
+                ed = S.f.erd ?? r.desc ?? "";
+              return `<div class="card" style="border:2px solid var(--teal)"><h3>Edit incident</h3><label for="erc">Type</label><select id="erc">${(EVS.includes(ec) ? EVS : [ec, ...EVS]).map((c) => `<option ${c === ec ? "selected" : ""}>${c}</option>`).join("")}</select><label for="erl">Location</label><input id="erl" type="text" value="${esc(el)}"><div class="notice">Tap the reviewer map to update this incident’s location.</div><label for="ert">Time observed</label><input id="ert" type="time" value="${esc(et)}"><label for="erd">Description</label><textarea id="erd" rows="3">${esc(ed)}</textarea><button class="btn p" data-a="saveedit" data-rid="${r.id}">Save changes</button><button class="btn" data-a="canceledit">Cancel</button></div>`;
+            }
+            return `<div class="card"><div>${r.published ? badge("b-ver", "PUBLISHED", "✔") : badge("b-warn", "PENDING REVIEW", "⌛")}</div><h3>${esc(r.cat)}</h3><div class="meta">${esc(un(r.area || "Location not given"))} · ${esc(r.time || "Time not given")} · Submitted by ${esc(r.who || "Anonymous")}</div>${r.desc ? `<p>${esc(r.desc)}</p>` : '<p class="meta">No description supplied.</p>'}${photo}${!r.published ? (canPublish ? `<button class="btn p" data-a="approve" data-rid="${r.id}">Accept and publish to map</button>` : '<div class="notice">This report needs a selected Mauritius map location before it can be published.</div>') : ""}<div style="display:flex;gap:8px"><button class="btn s" data-a="editreport" data-rid="${r.id}">Edit</button><button class="btn s d" data-a="deletereport" data-rid="${r.id}">Delete</button></div></div>`;
+          };
+        return `<div class="phone"><main class="scr"><h1>Review reports</h1><div class="meta">Approved reports appear on the public map and alerts for 20 hours.</div><h2>Incident locations</h2><div id="review-map" role="application" aria-label="Reviewer incident map"></div>${S.editId ? '<div class="notice">Tap the map to set the edited incident location.</div>' : ""}${reports.length ? reports.map(card).join("") : '<div class="card">No reports are waiting for review.</div>'}${S.toast ? `<div class="toast" role="status">${S.toast}</div>` : ""}</main></div>`;
+      }
+      function App() {
+        if (S.view === "review") return Reviewer();
+        const body = { alerts: Alerts, map: MapS, report: Report, contacts: Contacts, profile: Profile }[S.tab]();
+        return `<div class="phone"><main class="scr">${body}${S.toast ? `<div class="toast" role="status">${S.toast}</div>` : ""}</main>${S.drawer && S.tab === "alerts" ? Drawer() : ""}<nav class="nav" aria-label="Main">${NAV.map((n) => `<button data-t="${n[0]}" aria-label="${n[2]}" ${S.tab === n[0] ? 'aria-current="page"' : ""}><span aria-hidden="true">${n[1]}</span>${n[2]}</button>`).join("")}</nav></div>`;
+      }
+      /* ============================================================
+         9. RENDERING
+         draw() rebuilds #root from state, then initialises the right Leaflet map.
+         ============================================================ */
+      function draw() {
+        syncLanguage();
+        const keep = document.activeElement && document.activeElement.id;
+        $("#root").innerHTML = App();
+        if (S.view === "review") initReviewMap();
+        else if (S.tab === "map") initMap();
+        else if (S.tab === "report") initReportMap();
+        if (keep) {
+          const e = document.getElementById(keep);
+          e && e.focus && e.focus();
+        }
+      }
+      // Show a message for ~2.6 s.
+      function toast(t) {
+        S.toast = t;
+        draw();
+        setTimeout(() => {
+          S.toast = "";
+          draw();
+        }, 2600);
+      }
+      /* ============================================================
+         10. PHOTO CAPTURE
+         Gallery picker, live camera, resize to max 640 px JPEG.
+         ============================================================ */
+      function pick(cam) {
+        const i = document.createElement("input");
+        i.type = "file";
+        i.accept = "image/*";
+        if (cam) i.capture = "environment";
+        i.onchange = () => {
+          const f = i.files[0];
+          if (!f) return;
+          const img = new Image(),
+            u = URL.createObjectURL(f);
+          img.onload = () => {
+            const sc = Math.min(1, 640 / Math.max(img.width, img.height)),
+              c = document.createElement("canvas");
+            c.width = img.width * sc;
+            c.height = img.height * sc;
+            c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+            S.photo = c.toDataURL("image/jpeg", 0.7);
+            S.rerr = "";
+            URL.revokeObjectURL(u);
+            draw();
+          };
+          img.src = u;
+        };
+        i.click();
+      }
+      let CAMERA_STREAM = null;
+      function stopCamera() {
+        if (CAMERA_STREAM) {
+          CAMERA_STREAM.getTracks().forEach((t) => t.stop());
+          CAMERA_STREAM = null;
+        }
+        S.camera = false;
+      }
+      async function openDeviceCamera() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          pick(true);
+          return;
+        }
+        try {
+          CAMERA_STREAM = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+          S.camera = true;
+          draw();
+          const v = $("#cam-video");
+          if (v) {
+            v.srcObject = CAMERA_STREAM;
+            v.play().catch(() => {});
+          }
+        } catch (e) {
+          stopCamera();
+          pick(true);
+        }
+      }
+      function captureCameraPhoto() {
+        const v = $("#cam-video");
+        if (!v || !v.videoWidth) return toast("Camera is still starting.");
+        const scale = Math.min(1, 640 / Math.max(v.videoWidth, v.videoHeight)),
+          c = document.createElement("canvas");
+        c.width = Math.round(v.videoWidth * scale);
+        c.height = Math.round(v.videoHeight * scale);
+        c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+        S.photo = c.toDataURL("image/jpeg", 0.7);
+        S.rerr = "";
+        stopCamera();
+        draw();
+      }
+      /* ============================================================
+         11. LOCATION
+         Map "near me" lookup, closest incident, and report auto-location with 1 km fallback.
+         ============================================================ */
+      function locateMapPosition(onSuccess, onFailure) {
+        if (!navigator.geolocation) {
+          onFailure && onFailure();
+          return toast("Location is not available on this device.");
+        }
+        toast("Asking for your location…");
+        navigator.geolocation.getCurrentPosition(
+          (p) => {
+            const here = { lat: p.coords.latitude, lng: p.coords.longitude };
+            if (!inMauritius(here.lat, here.lng)) {
+              onFailure && onFailure();
+              return toast("Your location is outside Mauritius.");
+            }
+            S.me = here;
+            S.mv = { c: [here.lat, here.lng], z: 15 };
+            onSuccess && onSuccess();
+            draw();
+          },
+          () => {
+            onFailure && onFailure();
+            toast("Could not get your location.");
+          },
+          { timeout: 10000 },
+        );
+      }
+      function chooseClosestIncident() {
+        const xs = mapIncidents();
+        if (!xs.length) return toast("No current incident is available to compare.");
+        const closest = xs.reduce((best, x) => (!best || distanceKm(S.me, x) < distanceKm(S.me, best) ? x : best), null),
+          km = distanceKm(S.me, closest);
+        S.closestId = closest.id;
+        S.mv = { c: [closest.lat, closest.lng], z: 15 };
+        toast(`Closest incident: ${closest.cat}, ${km.toFixed(1)} km away.`);
+      }
+      // fbCircle(): true when auto-location failed but a last known position exists -> 1 km tap-to-choose circle.
+      // fillLocation(): runs when the Report tab opens (and from "Use my location"); fills the field and map pin.
+      const fbCircle = () => S.locState === "fail" && !!S.me;
+      function maybeAutoLocate() {
+        if (S.view === "app" && S.tab === "report" && !S.sent && !S.repPos && S.locState === "idle") fillLocation(true);
+      }
+      function fillLocation(auto) {
+        const fail = (m) => {
+          S.locState = "fail";
+          S.geoHint = m;
+          S.toast = "";
+          draw();
+          if (!auto) {
+            const mp = document.getElementById("report-map");
+            mp && mp.scrollIntoView({ block: "center" });
+          }
+        };
+        if (S.user.pref.loc === "Never share location") return fail("Location sharing is turned off in your Profile.");
+        if (!navigator.geolocation) return fail("Location is not available on this device.");
+        S.locState = "busy";
+        S.geoHint = "";
+        draw();
+        const before = S.repPos,
+          stale = () => {
+            if (S.repPos !== before) {
+              if (S.locState === "busy") S.locState = "idle";
+              draw();
+              return true;
+            }
+            return false;
+          };
+        navigator.geolocation.getCurrentPosition(
+          async (p) => {
+            const lat = p.coords.latitude,
+              lng = p.coords.longitude;
+            if (stale()) return;
+            if (!inMauritius(lat, lng)) return fail("Your location is outside Mauritius.");
+            S.me = { lat, lng };
+            const g = await revgeo(lat, lng);
+            if (stale()) return;
+            S.f.rl = g.place;
+            S.repPos = { lat, lng, town: g.town };
+            S.locState = "ok";
+            S.geoHint = "";
+            S.rerr = "";
+            draw();
+          },
+          () => {
+            if (stale()) return;
+            fail("Could not get your location. Check that location access is allowed.");
+          },
+          { timeout: 10000, enableHighAccuracy: true },
+        );
+      }
+      /* ============================================================
+         12. SUBMIT REPORT
+         Validates location/photo/"Other" text/duplicates, encrypts via relay(), stores as pending.
+         ============================================================ */
+      async function sendReport() {
+        const lc = ($("#rl").value || "").trim() || "Location not given",
+          tm = $("#rt").value || now(),
+          ds = ($("#rd").value || "").trim(),
+          pos = S.repPos || {};
+        if (S.sending) return;
+        const cat = S.cat === OTHER ? (S.f.ro || "").trim() : S.cat;
+        if (S.cat === OTHER && !cat) {
+          S.rerr = "Please describe the incident you are reporting.";
+          return draw();
+        }
+        if (!inMauritius(pos.lat, pos.lng)) {
+          S.rerr = "Choose the incident location first: tap “Use my location” or tap the map.";
+          return draw();
+        }
+        if (!S.photo) {
+          S.rerr = "A photo is required. Take a photo or choose one before sending.";
+          return draw();
+        }
+        const dup = findDuplicate(cat, pos);
+        if (dup) {
+          S.rerr = `${cat} was already reported at ${un(dup.area || dup.town || "this location")}.`;
+          return draw();
+        }
+        S.rerr = "";
+        S.sending = true;
+        draw();
+        const p = {
+          cat: cat,
+          time: tm,
+          area: esc(lc),
+          town: pos.town || matchTown(lc) || "Other",
+          lat: pos.lat,
+          lng: pos.lng,
+          desc: ds,
+          photo: S.photo,
+          who: S.user.name || "Anonymous",
+          miss: [!ds && "Description"].filter(Boolean).join(", ") || "None",
+        };
+        const r = await relay(p);
+        if (SB) {
+          try {
+            await sbSubmit(r);
+          } catch (e) {
+            S.sending = false;
+            S.rerr = "Could not send the report. Check your connection and try again.";
+            return draw();
+          }
+        }
+        r.id = S.nid++;
+        r.published = false;
+        if (!SB) S.reports.push(r); /* with Supabase, the admin dashboard is the only review queue */
+        persist();
+        S.sending = false;
+        S.sent = true;
+        S.photo = null;
+        S.repPos = null;
+        S.f.rl = "";
+        S.f.rd = "";
+        S.f.ro = "";
+        S.locState = "idle";
+        S.geoHint = "";
+        draw();
+      }
+      /* ============================================================
+         13. EVENTS
+         One delegated click handler (data-* attributes decide the action), plus input/change handlers.
+         ============================================================ */
+      document.addEventListener("click", (e) => {
+        const b = e.target.closest("button");
+        if (!b) return;
+        if (b.id === "appb" || b.id === "reviewb") {
+          S.view = b.id === "reviewb" ? "review" : "app";
+          $("#appb").setAttribute("aria-pressed", String(S.view === "app"));
+          $("#reviewb").setAttribute("aria-pressed", String(S.view === "review"));
+          return draw();
+        }
+        const d = b.dataset;
+        if (d.ft) {
+          S.fl.town = d.ft;
+          return draw();
+        }
+        if (d.fe) {
+          S.fl.ev = d.fe;
+          return draw();
+        }
+        if (d.t) {
+          if (d.t !== "report") stopCamera();
+          S.tab = d.t;
+          S.drawer = false;
+          if (d.t !== "report") S.sent = false;
+          draw();
+          if (d.t === "report") maybeAutoLocate();
+          return;
+        }
+        if (d.cat) {
+          S.cat = d.cat;
+          S.rerr = "";
+          draw();
+          if (d.cat === OTHER)
+            setTimeout(() => {
+              const o = $("#ro");
+              o && o.focus();
+            }, 0);
+          return;
+        }
+        if (d.near !== undefined) {
+          S.near = d.near === "all" ? "all" : Number(d.near);
+          S.closestId = null;
+          if (!S.me && S.near !== "all")
+            return locateMapPosition(null, () => {
+              S.near = "all";
+            });
+          return draw();
+        }
+        if (d.q) {
+          S.sel = +d.q;
+          return draw();
+        }
+        if (d.a === "editreport" && d.rid) {
+          const r = S.reports.find((x) => x.id == d.rid);
+          if (r) {
+            S.editId = r.id;
+            S.editPos = inMauritius(r.lat, r.lng) ? { lat: r.lat, lng: r.lng, town: r.town } : null;
+            ["erc", "erl", "ert", "erd"].forEach((k) => delete S.f[k]);
+            return draw();
+          }
+        }
+        if (d.a === "canceledit") {
+          S.editId = null;
+          S.editPos = null;
+          ["erc", "erl", "ert", "erd"].forEach((k) => delete S.f[k]);
+          return draw();
+        }
+        if (d.a === "saveedit" && d.rid) {
+          const r = S.reports.find((x) => x.id == d.rid),
+            pos = S.editPos || r;
+          if (!r || !inMauritius(pos.lat, pos.lng)) return toast("Choose a Mauritius map location before saving.");
+          r.cat = ($("#erc") || { value: r.cat }).value;
+          r.area = esc(($("#erl") || { value: un(r.area || "") }).value.trim() || "Location not given");
+          r.time = ($("#ert") || { value: r.time }).value;
+          r.desc = ($("#erd") || { value: r.desc }).value.trim();
+          r.lat = pos.lat;
+          r.lng = pos.lng;
+          r.town = pos.town || matchTown(un(r.area)) || r.town;
+          S.editId = null;
+          S.editPos = null;
+          ["erc", "erl", "ert", "erd"].forEach((k) => delete S.f[k]);
+          persist();
+          return toast("Incident updated.");
+        }
+        if (d.a === "deletereport" && d.rid) {
+          const r = S.reports.find((x) => x.id == d.rid);
+          if (r && confirm("Delete this incident report?")) {
+            S.reports = S.reports.filter((x) => x.id != d.rid);
+            persist();
+            return toast("Incident deleted.");
+          }
+          return;
+        }
+        if (d.a === "approve" && d.rid) {
+          const r = S.reports.find((x) => x.id == d.rid);
+          if (r && inMauritius(r.lat, r.lng)) {
+            r.published = true;
+            r.publishedAt = Date.now();
+            persist();
+            const n = notifyIncident(r);
+            return toast("Report approved and published to the map and alerts." + (n ? " You were notified: " + n + "." : ""));
+          }
+          return toast("This report needs a Mauritius map location before it can be published.");
+        }
+        if (d.del) {
+          S.pins = S.pins.filter((p) => p.id != d.del);
+          persist();
+          return draw();
+        }
+        switch (d.a) {
+          case "saveprof": {
+            const g = (i) => ($(i) || { value: "" }).value.trim(),
+              em = g("#pfe"),
+              digits = g("#pfp").replace(/\D/g, ""),
+              ph = digits ? "+230 " + digits : "";
+            if (em && !/^\S+@\S+\.\S+$/.test(em)) return toast("Enter a valid email address.");
+            if (digits && !/^\d{7,8}$/.test(digits)) return toast("Enter a 7 or 8 digit Mauritius phone number.");
+            Object.assign(S.user, { name: g("#pfn"), email: em, phone: ph, town: $("#pft").value });
+            persist();
+            toast("Details saved on this device.");
+            break;
+          }
+          case "wipe": {
+            if (confirm("Delete your saved details and pins from this device?")) {
+              try {
+                localStorage.removeItem("morisafe_d");
+              } catch (e) {}
+              S.pins = [];
+              Object.assign(S.user, { name: "", email: "", phone: "", town: "Not set" });
+              toast("Saved data deleted.");
+            }
+            break;
+          }
+          case "filters":
+            S.drawer = true;
+            draw();
+            break;
+          case "fclose":
+            S.drawer = false;
+            draw();
+            break;
+          case "seemap": {
+            const r = S.reports.find((x) => x.id == d.id);
+            S.tab = "map";
+            if (r && r.lat != null) S.mv = { c: [r.lat, r.lng], z: 16 };
+            draw();
+            break;
+          }
+          case "rep":
+            S.tab = "report";
+            S.sent = false;
+            draw();
+            maybeAutoLocate();
+            break;
+          case "openphoto": {
+            const r = S.reports.find((x) => x.id == d.rid);
+            if (r && r.photo) {
+              S.photoView = r.photo;
+              draw();
+            }
+            break;
+          }
+          case "closephoto":
+            S.photoView = null;
+            draw();
+            break;
+          case "cam":
+            openDeviceCamera();
+            break;
+          case "takecapture":
+            captureCameraPhoto();
+            break;
+          case "closecam":
+            stopCamera();
+            draw();
+            break;
+          case "gal":
+            pick(false);
+            break;
+          case "nophoto":
+            S.photo = null;
+            draw();
+            break;
+          case "geo":
+            fillLocation(false);
+            break;
+          case "near4":
+            if (S.alertNear) {
+              S.alertNear = false;
+              draw();
+              break;
+            }
+            if (S.me) {
+              S.alertNear = true;
+              draw();
+              break;
+            }
+            locateMapPosition(() => {
+              S.alertNear = true;
+            });
+            break;
+          case "maploc":
+            locateMapPosition(() => toast("Location set for nearby incident searches."));
+            break;
+          case "closest":
+            S.near = "all";
+            S.closestId = null;
+            if (!S.me) {
+              locateMapPosition(() => chooseClosestIncident());
+              break;
+            }
+            chooseClosestIncident();
+            break;
+          case "addpin":
+            S.addMode = true;
+            S.draft = null;
+            draw();
+            break;
+          case "cancelpin":
+            S.draft = null;
+            S.addMode = false;
+            draw();
+            break;
+          case "savepin": {
+            const n = ($("#pn") || { value: "" }).value.trim(),
+              dr = S.draft;
+            S.pins.push({
+              id: Date.now(),
+              lat: dr.lat,
+              lng: dr.lng,
+              place: dr.place || dr.lat.toFixed(5) + ", " + dr.lng.toFixed(5),
+              town: dr.town || "Other",
+              cat: S.cat,
+              note: n,
+            });
+            S.draft = null;
+            S.f.pn = "";
+            persist();
+            toast("Pin saved (encrypted) on this device, unverified.");
+            break;
+          }
+          case "send":
+            sendReport();
+            break;
+          case "anew":
+            S.sent = false;
+            S.tab = "alerts";
+            draw();
+            break;
+        }
+      });
+      document.addEventListener("input", (e) => {
+        const t = e.target;
+        if (t.id) S.f[t.id] = t.type === "checkbox" ? t.checked : t.value;
+      });
+      document.addEventListener("change", (e) => {
+        const t = e.target;
+        if (!S.user) return;
+        const p = S.user.pref;
+        if (t.dataset.lang) p.lang = t.value;
+        if (t.dataset.n) p.n[t.dataset.n] = t.checked;
+        if (t.dataset.n10 !== undefined) p.n10 = t.checked;
+        if ((t.dataset.n || t.dataset.n10 !== undefined) && t.checked && "Notification" in window && Notification.permission === "default")
+          Notification.requestPermission();
+        if (t.dataset.loc) p.loc = t.value;
+        if (t.dataset.d) document.body.classList.toggle(t.dataset.d, t.checked);
+        persist();
+      });
+      /* ============================================================
+         13b. SUPABASE BRIDGE (added)
+         Submits reports to the `reports` table + `report-photos` bucket, and pulls APPROVED reports
+         for the public Alerts/Map. Fill in the two constants below (anon key only, never service-role).
+         ============================================================ */
+      const SB_URL = "https://nxvrfwdeymjrohvppuuk.supabase.co",
+        SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im54dnJmd2RleW1qcm9odnBwdXVrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ1NjAzODYsImV4cCI6MjExMDEzNjM4Nn0.XWqqObSJwni7p-M3mc8r4u1WcpttxMo1YWmkR6Q57pM";
+      const SB = window.supabase && !SB_URL.startsWith("PASTE") ? window.supabase.createClient(SB_URL, SB_KEY) : null;
+      const okImg = (x) => /^(data:image\/|https:\/\/)/.test(x || "");
+      async function sbSubmit(r) {
+        let image_url = null;
+        if (r.photo) {
+          const blob = await (await fetch(r.photo)).blob(),
+            path = crypto.randomUUID() + ".jpg",
+            up = await SB.storage.from("report-photos").upload(path, blob, { contentType: "image/jpeg" });
+          if (up.error) throw up.error;
+          image_url = SB.storage.from("report-photos").getPublicUrl(path).data.publicUrl;
+        }
+        const place = un(r.area || "Mauritius");
+        const { error } = await SB.from("reports").insert({
+          title: r.cat + " - " + place,
+          category: r.cat,
+          description: r.desc || "",
+          latitude: r.lat,
+          longitude: r.lng,
+          location_name: place,
+          image_url,
+          observed_time: r.time,
+          status: "pending",
+        }); /* no .select(): anon users may insert but not read pending rows */
+        if (error) throw error;
+      }
+      let SB_SIG = "";
+      async function sbPull() {
+        if (!SB) return;
+        const { data, error } = await SB.from("reports").select("*").eq("status", "approved");
+        if (error || !data) return;
+        const sig = data.map((x) => x.id + x.approved_at).join();
+        if (sig === SB_SIG) return;
+        SB_SIG = sig;
+        const mapped = data.map((x) => ({
+          id: "sb-" + x.id, remote: true, cat: x.category, area: esc(x.location_name || ""), town: matchTown(x.location_name || "") || "Other",
+          lat: Number(x.latitude), lng: Number(x.longitude), time: x.observed_time || "", desc: x.description || "", photo: x.image_url,
+          published: true, publishedAt: Date.parse(x.approved_at || x.created_at), who: "Public",
+        }));
+        S.reports = S.reports.filter((r) => !r.remote).concat(mapped);
+        if (S.view === "app" && (S.tab === "alerts" || S.tab === "map")) draw();
+      }
+      /* ============================================================
+         14. START-UP
+         First render, then load saved data and start location tracking if allowed.
+         ============================================================ */
+      draw();
+      loadSaved().finally(() => {
+        if (S.user.pref.loc !== "Never share location") ensureMapLocation();
+        sbPull();
+        setInterval(sbPull, 60000);
+      });
+    </script>
+  </body>
+</html>
