@@ -1,3 +1,3 @@
 # Hackathon-Error-404
 
-# LOG 1:
+# FUCK IT WE BALL
