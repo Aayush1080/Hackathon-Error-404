@@ -272,7 +272,22 @@ Needs PostgreSQL 16, the `postgrest` binary and `pip install -r server/requireme
 cd server
 devstack/reset_db.sh            # fresh database: your schema + prototype-style rows + 001 applied twice
 ```
+## Tech stack
 
+| Layer | Technologies |
+|---|---|
+| **Public app** (`app/`) | JavaScript (ES2020), Vite, Leaflet, Capacitor (Android), Web Crypto API (AES-256-GCM) |
+| **Admin dashboard** (`admin/`) | React 18, Vite, Tailwind CSS 4, Leaflet |
+| **API server** (`server/`) | Python 3.12, FastAPI, Uvicorn, Pillow + pillow-heif, Supabase Python client |
+| **Database & storage** | Supabase: PostgreSQL, Auth (admin accounts), Storage (private photo bucket) |
+| **Maps & location** | Leaflet, Esri World Street Map tiles, OpenStreetMap Nominatim (reverse geocoding) |
+| **Mobile (Android)** | Capacitor plugins: App, Camera, Geolocation, Local Notifications, Push Notifications · Gradle, Java 21, Android SDK |
+| **Translation** | Google Cloud Translation, with MyMemory as a fallback (English, French, Kreol Morisien) |
+| **Notifications** | In-app notifications; Firebase Cloud Messaging for background push (optional) |
+| **Security** | scrypt password hashing, HMAC-hashed national ID numbers, signed session tokens, proof-of-work anti-bot checks, rate limiting, photo re-encoding (strips EXIF/GPS) |
+| **Testing** | pytest |
+| **Deployment** | Docker, Render, Cloudflare Tunnel (HTTPS access from phones during development) |
+| **Tooling** | Git, npm, PowerShell scripts (`start-all.ps1`, `start-phone.ps1`) |
 
 ## Limits worth knowing
 
