@@ -1,6 +1,8 @@
 # Hackathon-Error-404
 # MoriSafe
 
+DISCLAIMER: AI Tools such as Claude and Chat GPT were used in guiding us and helping us better our project.
+
 Community incident reporting and public alerts for Mauritius. Citizens report hazards (fire, accident,
 flooding, falling debris, other) with a photo and location from their phone; administrators review each
 report; approved reports appear in the public Alerts list and Map for 20 hours.
