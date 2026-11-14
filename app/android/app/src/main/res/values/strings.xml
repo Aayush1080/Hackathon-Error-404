@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">MoriSafe</string>
+    <string name="title_activity_main">MoriSafe</string>
+    <string name="package_name">mu.morisafe.app</string>
+    <string name="custom_url_scheme">mu.morisafe.app</string>
+</resources>

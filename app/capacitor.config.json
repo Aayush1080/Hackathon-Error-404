@@ -1,0 +1,8 @@
+{
+  "appId": "mu.morisafe.app",
+  "appName": "MoriSafe",
+  "webDir": "dist",
+  "plugins": {
+    "LocalNotifications": { "iconColor": "#0b6e78" }
+  }
+}
