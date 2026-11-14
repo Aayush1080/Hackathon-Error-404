@@ -1,0 +1,22 @@
+# Render Blueprint: one web service serving the public app (/), admin dashboard (/admin) and API (/api).
+# Render → New → Blueprint → pick this repo. It asks for the two Supabase values below.
+# Free tier sleeps after ~15 min idle: open /api/health a minute before demoing.
+services:
+  - type: web
+    name: morisafe
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    healthCheckPath: /api/health
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: APP_SECRET
+        generateValue: true
+      # The app and dashboard are served from the same address, so they need no entry here.
+      # These are the Android/iOS app and local development.
+      - key: ALLOWED_ORIGINS
+        value: https://localhost,capacitor://localhost,http://localhost:5173,http://localhost:5174,http://localhost:5175
