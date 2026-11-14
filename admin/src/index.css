@@ -1,0 +1,15 @@
+@import "tailwindcss";
+body { font-family: "Plus Jakarta Sans", system-ui, -apple-system, "Segoe UI", sans-serif; background: #f5f7fb; color: #0f1b2d; -webkit-font-smoothing: antialiased; }
+.tile { display: inline-grid; place-items: center; border-radius: 30%; flex: none; background: color-mix(in srgb, var(--c) 14%, #fff); }
+.brand-grad { background: linear-gradient(135deg, #0e9f8f, #2563eb); }
+.me-dot{width:18px;height:18px;border-radius:50%;background:#2563eb;border:3px solid #fff;box-shadow:0 0 0 6px rgba(37,99,235,.2)}
+
+/* Map symbols (src/lib/icons.js, same as the public app) */
+.cat-ic{display:inline-flex;align-items:center;justify-content:center;border-radius:50%;flex:none;vertical-align:middle;box-shadow:0 0 0 2px #fff,0 1px 3px rgba(0,0,0,.25)}
+.ipin-wrap,.poi-wrap{background:none;border:0}
+.ipin{width:34px;height:34px;border-radius:50% 50% 50% 0;background:var(--c);transform:rotate(-45deg);border:2.5px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center}
+.ipin>span{transform:rotate(45deg);display:flex}
+.ipin-old{opacity:.5;filter:saturate(.4)}
+.ipin-police{box-shadow:0 0 0 3px #1d3a8a,0 2px 6px rgba(0,0,0,.35)}
+.poi{width:21px;height:21px;border-radius:7px;background:var(--c);border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center}
+.poi-inline{display:inline-flex;width:20px;height:20px;border-radius:6px;vertical-align:middle;box-shadow:none}
