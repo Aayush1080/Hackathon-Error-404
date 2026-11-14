@@ -1,0 +1,2897 @@
+"""Machine translation of report text (descriptions and "Other" incident names) for the public app.
+
+Provider: Google Cloud Translation if GOOGLE_TRANSLATE_API_KEY is set, otherwise the free MyMemory API.
+Results are cached in public.translations (and in memory), so each text is translated once per language.
+Only approved, public report text is ever sent for translation. Kreol Morisien falls back to French when
+the provider has no Kreol model."""
+from __future__ import annotations
+
+import hashlib
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait
+
+import httpx
+
+from .core import db, log
+
+LANGS = {"en", "fr", "mfe"}
+_mem: dict[str, str] = {}
+_pending: set[str] = set()
+_lock = threading.Lock()
+_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="translate")
+_http = httpx.Client(timeout=8, headers={"User-Agent": "MoriSafe/1.0"})
+
+
+def _key(lang: str, text: str) -> str:
+    return hashlib.sha256(f"{lang}\n{text}".encode()).hexdigest()
+
+
+def _google(text: str, lang: str) -> str | None:
+    key = os.getenv("GOOGLE_TRANSLATE_API_KEY")
+    if not key:
+        return None
+    r = _http.post("https://translation.googleapis.com/language/translate/v2",
+                   params={"key": key}, json={"q": text, "target": lang, "format": "text"})
+    if r.status_code != 200:
+        log.warning("google translate %s: %s", r.status_code, r.text[:200])
+        return None
+    return r.json()["data"]["translations"][0]["translatedText"]
+
+
+def _mymemory(text: str, lang: str) -> str | None:
+    r = _http.get("https://api.mymemory.translated.net/get", params={"q": text[:500], "langpair": f"Autodetect|{lang}"})
+    if r.status_code != 200:
+        return None
+    d = r.json()
+    rd = d.get("responseData") or {}
+    out = rd.get("translatedText")
+    if str(rd.get("detectedLanguage") or "").lower().startswith(lang) or (out and "SELECT TWO DISTINCT" in out.upper()):
+        return text  # already in that language
+    if d.get("responseStatus") not in (200, "200") or not out or "MYMEMORY WARNING" in out:
+        return None
+    return out
+
+
+def _translate_one(text: str, lang: str) -> str:
+    """Never raises: on any failure the original text is returned (and not cached, so it is retried later)."""
+    k = _key(lang, text)
+    try:
+        out = _google(text, lang)
+        if out is None and lang == "mfe":
+            out = _google(text, "fr")
+        if out is None:
+            out = _mymemory(text, "fr" if lang == "mfe" else lang)
+    except Exception as exc:  # network trouble: show the original for now
+        log.warning("translation failed: %s", exc)
+        out = None
+    finally:
+        with _lock:
+            _pending.discard(k)
+    if not out:
+        return text
+    with _lock:
+        _mem[k] = out
+    try:
+        db().table("translations").upsert({"key": k, "lang": lang, "text": out}, on_conflict="key").execute()
+    except Exception as exc:
+        log.warning("translation cache write failed: %s", exc)
+    return out
+
+
+def translate_many(texts: list[str], lang: str, budget_s: float = 4.0) -> dict[str, str]:
+    """{original: translated} for every non-empty text. Anything not ready within the budget keeps
+    translating in the background and is served from the cache on the next request."""
+    texts = [t for t in dict.fromkeys(texts) if t and t.strip()]
+    if lang not in LANGS or not texts:
+        return {}
+    out: dict[str, str] = {}
+    missing: dict[str, str] = {}
+    for t in texts:
+        k = _key(lang, t)
+        if k in _mem:
+            out[t] = _mem[k]
+        else:
+            missing[k] = t
+    if missing:
+        try:
+            rows = db().table("translations").select("key,text").in_("key", list(missing)).execute().data
+        except Exception:
+            rows = []
+        for r in rows:
+            _mem[r["key"]] = r["text"]
+            out[missing.pop(r["key"])] = r["text"]
+    futures = {}
+    for k, t in missing.items():
+        with _lock:
+            if k in _pending:
+                continue
+            _pending.add(k)
+        futures[_pool.submit(_translate_one, t, lang)] = t
+    if futures:
+        done, _ = wait(futures, timeout=budget_s)
+        for f in done:
+            out[futures[f]] = f.result()
+    return out
+
+-- ============================================================
+-- MoriSafe 002: citizen accounts (NID sign-in), police reports, duplicate
+-- merging, "is it still there?" feedback, translation cache.
+-- Run in the Supabase SQL editor AFTER 001_api_gateway.sql. Safe to re-run.
+-- Never deletes report rows.
+-- ============================================================
+begin;
+
+-- 1. Citizen accounts ------------------------------------------------------
+--    The NID is never stored in plain text: nid_hash is an HMAC of it (for sign-in
+--    lookup) and nid_masked shows only the first and last characters to admins.
+--    password_hash is a salted scrypt hash produced by the API server.
+create table if not exists public.users (
+  id             uuid primary key default gen_random_uuid(),
+  nid_hash       text not null unique,
+  nid_masked     text not null,
+  full_name      text not null check (char_length(full_name) between 2 and 80),
+  phone          text,
+  password_hash  text not null check (password_hash like 'scrypt$%'),
+  role           text not null default 'citizen' check (role in ('citizen', 'police')),
+  disabled       boolean not null default false,
+  failed_logins  integer not null default 0,
+  locked_until   timestamptz,
+  last_login_at  timestamptz,
+  created_at     timestamptz not null default now()
+);
+alter table public.users enable row level security;  -- API server only (service role)
+
+-- 2. Reports: author, source, duplicate group -------------------------------
+alter table public.reports
+  add column if not exists user_id      uuid references public.users(id) on delete set null,
+  add column if not exists source       text not null default 'citizen',
+  add column if not exists duplicate_of uuid references public.reports(id) on delete set null;
+alter table public.reports drop constraint if exists reports_source_check;
+alter table public.reports add constraint reports_source_check check (source in ('citizen', 'police'));
+create index if not exists reports_duplicate_of_idx on public.reports (duplicate_of);
+create index if not exists reports_user_idx on public.reports (user_id, created_at desc);
+
+-- 3. Severity is no longer used (kept, nullable, so old rows are untouched) --
+alter table public.reports alter column severity drop not null;
+alter table public.reports alter column severity drop default;
+
+-- 4. "Is it still there?" answers from people passing nearby -----------------
+create table if not exists public.report_feedback (
+  report_id   uuid not null references public.reports(id) on delete cascade,
+  voter       text not null,              -- 'u:<user id>' or 'd:<device hash>'
+  still_there boolean not null,
+  created_at  timestamptz not null default now(),
+  primary key (report_id, voter)
+);
+alter table public.report_feedback enable row level security;
+
+-- 5. Machine-translation cache for report descriptions ------------------------
+create table if not exists public.translations (
+  key        text primary key,             -- sha256 of target language + source text
+  lang       text not null,
+  text       text not null,
+  created_at timestamptz not null default now()
+);
+alter table public.translations enable row level security;
+
+-- 6. Notification choices per incident type ----------------------------------
+alter table public.devices add column if not exists notify_categories text[];
+
+commit;
+
+notify pgrst, 'reload schema';
+
+# Copy to .env (never commit .env). The server refuses to start if a required value is missing.
+
+# Required: Supabase project URL and SERVICE ROLE key (Project Settings > API). Server-side only:
+# it bypasses row level security, so it must never appear in the app or the admin dashboard.
+SUPABASE_URL=https://YOUR-PROJECT-REF.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=replace-with-service-role-key
+
+# Required: signs admin sessions and device hashes. 32+ random characters:
+#   python -c "import secrets; print(secrets.token_urlsafe(48))"
+APP_SECRET=replace-with-a-long-random-string
+
+# Comma-separated browser origins allowed to call the API (no trailing slash).
+# https://localhost and capacitor://localhost are the Android and iOS apps.
+ALLOWED_ORIGINS=https://localhost,capacitor://localhost,http://localhost:5173,http://localhost:5174
+
+# Optional
+PHOTO_BUCKET=report-photos
+ADMIN_SESSION_HOURS=8
+MAX_UPLOAD_MB=10
+# Push notifications: path to (or JSON of) a Firebase service account key. Leave empty to disable.
+FIREBASE_SERVICE_ACCOUNT=
+
+.env
+__pycache__/
+.pytest_cache/
+devstack/.env.devstack
+devstack/postgrest.conf
+
+
+"""Configuration, Supabase access, error format, admin sessions, device identity and rate limits."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import logging
+import os
+import re
+import secrets
+import threading
+import time
+from dataclasses import dataclass
+from datetime import date
+from functools import lru_cache
+
+import httpx
+import jwt
+from fastapi import Depends, Header, Request
+from supabase import Client, create_client
+
+log = logging.getLogger("morisafe")
+
+DEFAULT_ORIGINS = [
+    "https://localhost",      # Capacitor Android
+    "capacitor://localhost",  # Capacitor iOS
+    "http://localhost",
+    "http://localhost:5173",  # admin dashboard (vite dev)
+    "http://localhost:5174",  # public app (vite dev)
+]
+
+
+@dataclass(frozen=True)
+class Settings:
+    supabase_url: str
+    service_key: str
+    app_secret: str
+    allowed_origins: tuple[str, ...]
+    photo_bucket: str
+    session_hours: float
+    max_upload_bytes: int
+    firebase_credentials: str | None
+    rate_limits: bool
+    human_check: bool
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        missing = [k for k in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "APP_SECRET") if not os.getenv(k)]
+        if missing:
+            raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}. See .env.example.")
+        secret = os.environ["APP_SECRET"]
+        if len(secret) < 32:
+            raise RuntimeError("APP_SECRET must be at least 32 characters (python -c \"import secrets; print(secrets.token_urlsafe(48))\").")
+        origins = [o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+        return cls(
+            supabase_url=os.environ["SUPABASE_URL"].rstrip("/"),
+            service_key=os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+            app_secret=secret,
+            allowed_origins=tuple(origins or DEFAULT_ORIGINS),
+            photo_bucket=os.getenv("PHOTO_BUCKET", "report-photos"),
+            session_hours=float(os.getenv("ADMIN_SESSION_HOURS", "8")),
+            max_upload_bytes=int(os.getenv("MAX_UPLOAD_MB", "10")) * 1024 * 1024,
+            firebase_credentials=os.getenv("FIREBASE_SERVICE_ACCOUNT") or None,
+            rate_limits=os.getenv("RATE_LIMITS", "on").lower() != "off",
+            human_check=os.getenv("HUMAN_CHECK", "on").lower() != "off",
+        )
+
+
+@lru_cache
+def settings() -> Settings:
+    return Settings.from_env()
+
+
+@lru_cache
+def db() -> Client:
+    """Service-role client. Server-side only; never call auth.sign_in* on it
+    (supabase-py would then reuse the signed-in user's token for every query)."""
+    s = settings()
+    return create_client(s.supabase_url, s.service_key)
+
+
+# ---------------------------------------------------------------- errors
+class ApiError(Exception):
+    """Every error response has the shape {"error": {"code", "message", "details"}}."""
+
+    def __init__(self, status: int, code: str, message: str, details=None, headers: dict | None = None):
+        super().__init__(message)
+        self.status, self.code, self.message, self.details, self.headers = status, code, message, details, headers
+
+
+# ---------------------------------------------------------------- devices
+_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def device_hash(device_id: str | None) -> str | None:
+    """The app sends a random UUID it generated (X-Device-Id). Only an HMAC of it is stored,
+    so reports can be grouped and rate-limited per device without identifying anyone."""
+    if not device_id or not _UUID.match(device_id):
+        return None
+    return hmac.new(settings().app_secret.encode(), b"device:" + device_id.lower().encode(), hashlib.sha256).hexdigest()
+
+
+def client_ip(request: Request) -> str:
+    # Behind a proxy (Render, Railway...), run uvicorn with --proxy-headers so this is the real client.
+    return request.client.host if request.client else "unknown"
+
+
+# ---------------------------------------------------------------- rate limits
+class RateLimiter:
+    """In-memory sliding window. Per process: fine for one server instance."""
+
+    def __init__(self):
+        self._hits: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def hit(self, key: str, limit: int, window_s: int) -> None:
+        if not settings().rate_limits:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if len(self._hits) > 20000:
+                self._hits = {k: v for k, v in self._hits.items() if v and now - v[-1] < 3600}
+            q = [t for t in self._hits.get(key, []) if now - t < window_s]
+            if len(q) >= limit:
+                retry = int(window_s - (now - q[0])) + 1
+                self._hits[key] = q
+                raise ApiError(429, "rate_limited", f"Too many requests. Try again in {retry} seconds.",
+                               {"retry_after": retry}, {"Retry-After": str(retry)})
+            q.append(now)
+            self._hits[key] = q
+
+    def reset(self) -> None:
+        with self._lock:
+            self._hits.clear()
+
+
+limiter = RateLimiter()
+
+
+# ---------------------------------------------------------------- admin sessions
+@dataclass(frozen=True)
+class Admin:
+    id: str
+    email: str | None
+    full_name: str | None
+    role: str
+
+    @property
+    def perms(self) -> set[str]:
+        return ROLE_PERMS.get(self.role, {"read"})
+
+    def public(self) -> dict:
+        return {"id": self.id, "email": self.email, "full_name": self.full_name, "role": self.role,
+                "permissions": sorted(self.perms)}
+
+
+# admins.role defaults to 'admin' in the existing schema. Unknown roles are read-only.
+ROLE_PERMS = {
+    "viewer": {"read"},
+    "moderator": {"read", "review", "edit"},
+    "admin": {"read", "review", "edit", "delete", "users"},
+    "superadmin": {"read", "review", "edit", "delete", "users"},
+}
+_revoked: dict[str, float] = {}  # jti -> expiry (per process; tokens also expire)
+
+
+def load_admin(user_id: str) -> Admin | None:
+    rows = db().table("admins").select("user_id,email,full_name,role").eq("user_id", user_id).limit(1).execute().data
+    if not rows:
+        return None
+    r = rows[0]
+    return Admin(id=r["user_id"], email=r.get("email"), full_name=r.get("full_name"), role=r.get("role") or "admin")
+
+
+def supabase_password_login(email: str, password: str) -> str | None:
+    """Checks the password with Supabase Auth (bcrypt hashes in auth.users).
+    Calls GoTrue directly instead of db().auth so the shared client never switches identity."""
+    s = settings()
+    try:
+        r = httpx.post(f"{s.supabase_url}/auth/v1/token", params={"grant_type": "password"},
+                       json={"email": email, "password": password},
+                       headers={"apikey": s.service_key, "Authorization": f"Bearer {s.service_key}"}, timeout=10)
+    except httpx.HTTPError as exc:
+        log.error("supabase auth unreachable: %s", exc)
+        raise ApiError(502, "auth_unavailable", "The sign-in service is unavailable. Try again shortly.")
+    if r.status_code == 200:
+        return r.json()["user"]["id"]
+    if r.status_code == 429:
+        raise ApiError(429, "rate_limited", "Too many sign-in attempts. Wait a few minutes and try again.")
+    if r.status_code in (400, 401, 403, 422):
+        return None
+    log.error("supabase auth error %s: %s", r.status_code, r.text[:300])
+    raise ApiError(502, "auth_unavailable", "The sign-in service is unavailable. Try again shortly.")
+
+
+def issue_admin_token(admin: Admin) -> dict:
+    s = settings()
+    now = int(time.time())
+    exp = now + int(s.session_hours * 3600)
+    token = jwt.encode({"sub": admin.id, "role": admin.role, "typ": "morisafe-admin", "iat": now, "exp": exp,
+                        "jti": secrets.token_hex(16)}, s.app_secret, algorithm="HS256")
+    return {"token": token, "expires_at": exp, "admin": admin.public()}
+
+
+def _claims(authorization: str | None) -> dict:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise ApiError(401, "not_authenticated", "Sign in as an administrator to continue.")
+    try:
+        claims = jwt.decode(authorization[7:].strip(), settings().app_secret, algorithms=["HS256"],
+                            options={"require": ["exp", "sub", "jti"]})
+    except jwt.ExpiredSignatureError:
+        raise ApiError(401, "session_expired", "Your session has expired. Sign in again.")
+    except jwt.PyJWTError:
+        raise ApiError(401, "invalid_token", "Your session is not valid. Sign in again.")
+    if claims.get("typ") != "morisafe-admin" or claims["jti"] in _revoked:
+        raise ApiError(401, "invalid_token", "Your session is not valid. Sign in again.")
+    return claims
+
+
+def revoke(authorization: str | None) -> None:
+    claims = _claims(authorization)
+    now = time.time()
+    for k in [k for k, v in _revoked.items() if v < now]:
+        _revoked.pop(k, None)
+    _revoked[claims["jti"]] = claims["exp"]
+
+
+def current_admin(authorization: str | None = Header(default=None)) -> Admin:
+    """Every admin request re-reads public.admins, so removing someone takes effect immediately.
+    The admin identity always comes from the verified token, never from the request body."""
+    claims = _claims(authorization)
+    admin = load_admin(claims["sub"])
+    if admin is None:
+        raise ApiError(401, "not_admin", "This account no longer has administrator access.")
+    return admin
+
+
+def require(perm: str):
+    def dep(admin: Admin = Depends(current_admin)) -> Admin:
+        if perm not in admin.perms:
+            raise ApiError(403, "forbidden", f"Your role ({admin.role}) cannot do this.")
+        return admin
+    return dep
+
+
+# ================================================================ citizen accounts (NID sign-in)
+# The National Identity Card number is 14 characters: the surname's first letter, the date of birth
+# as DDMMYY, then 7 letters/digits. It is only ever stored as an HMAC (lookup) and a masked copy.
+_NID = re.compile(r"^[A-Z]\d{6}[0-9A-Z]{7}$")
+NID_HELP = "Enter your 14-character National Identity Card number, for example A0101901234567."
+COMMON_PASSWORDS = {"password", "password1", "password123", "12345678", "123456789", "1234567890", "qwerty123",
+                    "azerty123", "morisafe", "morisafe1", "mauritius", "mauritius1", "iloveyou1", "abc12345", "admin123"}
+
+
+def normalise_nid(raw: str | None) -> str:
+    return re.sub(r"[\s\-]", "", raw or "").upper()
+
+
+def validate_nid(raw: str | None) -> str:
+    n = normalise_nid(raw)
+    if not _NID.fullmatch(n):
+        raise ApiError(422, "invalid_nid", NID_HELP, [{"field": "nid", "message": "format"}])
+    dd, mm, yy = int(n[1:3]), int(n[3:5]), int(n[5:7])
+    ok = False
+    for century in (1900, 2000):
+        try:
+            if date(century + yy, mm, dd) <= date.today():
+                ok = True
+        except ValueError:
+            pass
+    if not ok:
+        raise ApiError(422, "invalid_nid", "That NID number is not valid: characters 2 to 7 must be a date of birth (DDMMYY).",
+                       [{"field": "nid", "message": "date of birth"}])
+    return n
+
+
+def nid_hash(nid: str) -> str:
+    return hmac.new(settings().app_secret.encode(), b"nid:" + nid.encode(), hashlib.sha256).hexdigest()
+
+
+def nid_masked(nid: str) -> str:
+    return nid[0] + "*" * 9 + nid[-4:]
+
+
+def check_password(password: str, nid: str) -> None:
+    def bad(msg):
+        raise ApiError(422, "weak_password", msg, [{"field": "password", "message": msg}])
+    if len(password) < 8:
+        bad("Use at least 8 characters for your password.")
+    if len(password) > 128:
+        bad("Use 128 characters or fewer for your password.")
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+        bad("Use at least one letter and one number in your password.")
+    if password.lower() in COMMON_PASSWORDS or len(set(password)) < 4:
+        bad("That password is too easy to guess. Choose another one.")
+    if nid.lower() in password.lower() or nid[1:7] in password:
+        bad("Your password must not contain your NID number or date of birth.")
+
+
+# Salted scrypt (memory-hard, from the standard library). Stored as scrypt$N$r$p$salt$hash: the
+# password itself is never stored or logged.
+_SCRYPT = (2 ** 15, 8, 1)
+_SCRYPT_MEM = 128 * 1024 * 1024
+
+
+def hash_password(password: str) -> str:
+    n, r, p = _SCRYPT
+    salt = secrets.token_bytes(16)
+    h = hashlib.scrypt(password.encode(), salt=salt, n=n, r=r, p=p, maxmem=_SCRYPT_MEM, dklen=32)
+    return f"scrypt${n}${r}${p}${base64.b64encode(salt).decode()}${base64.b64encode(h).decode()}"
+
+
+def verify_password(password: str, stored: str | None) -> bool:
+    try:
+        _, n, r, p, salt, h = (stored or "").split("$")
+        got = hashlib.scrypt(password.encode(), salt=base64.b64decode(salt), n=int(n), r=int(r), p=int(p),
+                             maxmem=_SCRYPT_MEM, dklen=32)
+        return hmac.compare_digest(got, base64.b64decode(h))
+    except (ValueError, TypeError):
+        return False
+
+
+_DUMMY_HASH: list[str] = []
+
+
+def burn_password_time(password: str) -> None:
+    """Same work as a real check, so the response time does not reveal whether an NID is registered."""
+    if not _DUMMY_HASH:
+        _DUMMY_HASH.append(hash_password("not-a-real-password-1"))
+    verify_password(password, _DUMMY_HASH[0])
+
+
+@dataclass(frozen=True)
+class User:
+    id: str
+    full_name: str
+    role: str
+    nid_masked: str
+    phone: str | None = None
+
+    def public(self) -> dict:
+        return {"id": self.id, "full_name": self.full_name, "role": self.role, "nid_masked": self.nid_masked,
+                "phone": self.phone}
+
+
+USER_COLS = "id,full_name,role,nid_masked,phone,disabled"
+USER_TOKEN_DAYS = 30
+
+
+def user_from_row(r: dict) -> User:
+    return User(id=r["id"], full_name=r["full_name"], role=r.get("role") or "citizen", nid_masked=r["nid_masked"],
+                phone=r.get("phone"))
+
+
+def issue_user_token(user: User) -> dict:
+    now = int(time.time())
+    exp = now + USER_TOKEN_DAYS * 86400
+    token = jwt.encode({"sub": user.id, "typ": "morisafe-user", "iat": now, "exp": exp, "jti": secrets.token_hex(12)},
+                       settings().app_secret, algorithm="HS256")
+    return {"token": token, "expires_at": exp, "user": user.public()}
+
+
+def optional_user(authorization: str | None = Header(default=None)) -> User | None:
+    """The signed-in citizen, or None. A token that is present but invalid is an error, not "anonymous"."""
+    if not authorization:
+        return None
+    if not authorization.lower().startswith("bearer "):
+        raise ApiError(401, "invalid_token", "Your sign-in is not valid. Sign in again.")
+    try:
+        claims = jwt.decode(authorization[7:].strip(), settings().app_secret, algorithms=["HS256"],
+                            options={"require": ["exp", "sub"]})
+    except jwt.ExpiredSignatureError:
+        raise ApiError(401, "session_expired", "Your sign-in has expired. Sign in again.")
+    except jwt.PyJWTError:
+        raise ApiError(401, "invalid_token", "Your sign-in is not valid. Sign in again.")
+    if claims.get("typ") != "morisafe-user":
+        raise ApiError(401, "invalid_token", "Your sign-in is not valid. Sign in again.")
+    rows = db().table("users").select(USER_COLS).eq("id", claims["sub"]).limit(1).execute().data
+    if not rows:
+        raise ApiError(401, "invalid_token", "This account no longer exists. Create a new account.")
+    if rows[0].get("disabled"):
+        raise ApiError(403, "account_disabled", "This account has been disabled. Contact MoriSafe support.")
+    return user_from_row(rows[0])
+
+
+def current_user(user: User | None = Depends(optional_user)) -> User:
+    if user is None:
+        raise ApiError(401, "sign_in_required", "Sign in with your NID to continue.")
+    return user
+
+
+# ================================================================ human verification (anti-spam)
+# Proof of work: the server hands out a signed, single-use challenge and the app must find a nonce whose
+# SHA-256 starts with N zero bits. About a second for one person; very expensive for a bot sending thousands.
+POW_BITS = {"register": 16, "report": 15, "login": 12}
+POW_TTL = 600
+_pow_used: dict[str, float] = {}
+_pow_lock = threading.Lock()
+
+
+def _pow_sig(payload: str) -> str:
+    return hmac.new(settings().app_secret.encode(), b"pow:" + payload.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def issue_challenge(purpose: str) -> dict:
+    bits = POW_BITS[purpose]
+    exp = int(time.time()) + POW_TTL
+    payload = f"{purpose}.{bits}.{exp}.{secrets.token_hex(12)}"
+    return {"challenge": f"{payload}.{_pow_sig(payload)}", "bits": bits, "expires_at": exp,
+            "enabled": settings().human_check}
+
+
+def zero_bits(digest: bytes) -> int:
+    n = 0
+    for byte in digest:
+        if byte == 0:
+            n += 8
+            continue
+        return n + 8 - byte.bit_length()
+    return n
+
+
+def verify_human(proof: str | None, purpose: str) -> None:
+    """proof = "<challenge>:<nonce>", sent in the X-Human-Proof header."""
+    if not settings().human_check:
+        return
+    fail = ApiError(400, "verification_failed", "Human verification failed. Try again.")
+    if not proof or ":" not in proof or len(proof) > 300:
+        raise ApiError(400, "verification_required", "Human verification is required. Update the app and try again.")
+    challenge, nonce = proof.rsplit(":", 1)
+    parts = challenge.split(".")
+    if len(parts) != 5 or not nonce.isdigit() or len(nonce) > 20:
+        raise fail
+    p, bits, exp, _rand, sig = parts
+    if p != purpose or not bits.isdigit() or not exp.isdigit() or not hmac.compare_digest(sig, _pow_sig(".".join(parts[:4]))):
+        raise fail
+    now = time.time()
+    if int(exp) < now:
+        raise ApiError(400, "verification_expired", "Human verification expired. Try again.")
+    if zero_bits(hashlib.sha256(f"{challenge}:{nonce}".encode()).digest()) < int(bits):
+        raise fail
+    with _pow_lock:
+        for k in [k for k, v in _pow_used.items() if v < now]:
+            _pow_used.pop(k, None)
+        if challenge in _pow_used:
+            raise ApiError(400, "verification_reused", "Human verification was already used. Try again.")
+        _pow_used[challenge] = float(exp)
+
+"""FastAPI application: error format, CORS, security headers, request size guard, logging."""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+load_dotenv()
+
+from .core import ApiError, log, settings  # noqa: E402
+from .routes import router  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+MAX_BODY = 12 * 1024 * 1024
+# strict-origin-when-cross-origin: other sites (map tiles, address lookup) see only "morisafe's address", never the
+# page path. "no-referrer" made map and geocoding services refuse the requests.
+SECURITY_HEADERS = {"X-Content-Type-Options": "nosniff", "Referrer-Policy": "strict-origin-when-cross-origin",
+                    "X-Frame-Options": "DENY", "Cache-Control": "no-store"}
+
+
+def error_response(status: int, code: str, message: str, details=None, headers=None) -> JSONResponse:
+    return JSONResponse({"error": {"code": code, "message": message, "details": details}}, status_code=status, headers=headers)
+
+
+def create_app() -> FastAPI:
+    s = settings()  # fails fast with a clear message if the environment is incomplete
+    app = FastAPI(title="MoriSafe API", version="1.0.0",
+                  description="Hazard reporting for Mauritius. Public routes need no account; /api/admin/* need an admin session.")
+
+    @app.exception_handler(ApiError)
+    async def _api_error(_: Request, exc: ApiError):
+        return error_response(exc.status, exc.code, exc.message, exc.details, exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation(_: Request, exc: RequestValidationError):
+        details = [{"field": ".".join(str(p) for p in e["loc"][1:]) or str(e["loc"][0]), "message": e["msg"]} for e in exc.errors()]
+        return error_response(422, "validation_error", "Some fields are missing or invalid.", details)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http(_: Request, exc: StarletteHTTPException):
+        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, f"http_{exc.status_code}")
+        return error_response(exc.status_code, code, str(exc.detail))
+
+    @app.middleware("http")
+    async def guard(request: Request, call_next):
+        started = time.perf_counter()
+        length = request.headers.get("content-length")
+        if length and length.isdigit() and int(length) > MAX_BODY:
+            response = error_response(413, "request_too_large", "The upload is too large.")
+        else:
+            try:
+                response = await call_next(request)
+            except Exception:  # never leak internals; details go to the server log only
+                log.exception("unhandled error on %s %s", request.method, request.url.path)
+                response = error_response(500, "internal_error", "Something went wrong on the server. Try again.")
+        for k, v in SECURITY_HEADERS.items():
+            response.headers.setdefault(k, v)
+        log.info("%s %s -> %s (%.0f ms)", request.method, request.url.path, response.status_code,
+                 (time.perf_counter() - started) * 1000)
+        return response
+
+    # Added last, so it wraps everything (errors included get CORS headers). Bearer tokens, no cookies.
+    app.add_middleware(CORSMiddleware, allow_origins=list(s.allowed_origins), allow_credentials=False,
+                       allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+                       allow_headers=["Authorization", "Content-Type", "X-Device-Id", "X-Human-Proof"], max_age=600)
+
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+    status = {"message": "Mauritius Safety Alert Server is running!", "status": "online", "docs": "/docs"}
+
+    @app.get("/api")
+    def api_home():
+        return status
+
+    app.include_router(router)
+
+    # In the deployed image the built public app and admin dashboard live next to the server, so one
+    # address serves all three (no cross-site setup). Locally, without builds, "/" stays the status JSON.
+    site = Path(os.getenv("SITE_DIR", Path(__file__).resolve().parent.parent / "site"))
+    app_dir, admin_dir = site / "app", site / "admin"
+
+    def send(base: Path, rel: str):
+        f = (base / rel).resolve()
+        if rel and f.is_file() and f.is_relative_to(base.resolve()):
+            # Vite puts a content hash in every file name under assets/, so they can be cached for a year.
+            cache = "public, max-age=31536000, immutable" if rel.startswith("assets/") else "public, max-age=3600"
+            return FileResponse(f, headers={"Cache-Control": cache})
+        if rel.startswith("assets/") or rel.startswith("api/"):
+            raise StarletteHTTPException(404, "Not found")
+        return FileResponse(base / "index.html", headers={"Cache-Control": "no-cache"})  # single-page app routes
+
+    if (admin_dir / "index.html").is_file():
+        @app.get("/admin", include_in_schema=False)
+        @app.get("/admin/{rel:path}", include_in_schema=False)
+        def admin_site(rel: str = ""):
+            return send(admin_dir, rel)
+
+    if (app_dir / "index.html").is_file():
+        @app.get("/{rel:path}", include_in_schema=False)
+        def public_site(rel: str = ""):
+            return send(app_dir, rel)
+    else:
+        @app.get("/")
+        def home():
+            return status
+
+    return app
+
+
+app = create_app()
+
+"""Push notifications for newly approved reports, via Firebase Cloud Messaging (HTTP v1).
+
+Inactive until FIREBASE_SERVICE_ACCOUNT is set (path to, or JSON of, a Firebase service account key).
+Without it the mobile app still shows in-app notifications while it is running."""
+from __future__ import annotations
+
+import json
+import os
+
+import httpx
+
+from .core import db, log, settings
+from .rules import NEAR_KM, distance_km, label
+
+NEARBY_MARGIN_KM = 1.6  # device locations are rounded to 0.01 degrees (~1.1 km)
+
+
+def select_targets(devices: list[dict], report: dict) -> list[dict]:
+    """Devices that asked for this incident type (no choice saved = every type), minus
+    "only within 10 km" devices that are further away."""
+    out = []
+    for d in devices:
+        cats = d.get("notify_categories")
+        if not d.get("push_token") or (cats is not None and report["category"] not in cats):
+            continue
+        if d.get("only_nearby"):
+            if d.get("approx_lat") is None or d.get("approx_lng") is None:
+                continue
+            km = distance_km(float(d["approx_lat"]), float(d["approx_lng"]), float(report["latitude"]), float(report["longitude"]))
+            if km > NEAR_KM + NEARBY_MARGIN_KM:
+                continue
+        out.append(d)
+    return out
+
+
+def _credentials():
+    from google.oauth2 import service_account  # imported lazily: only needed when push is configured
+    raw = settings().firebase_credentials
+    info = json.loads(raw) if raw.strip().startswith("{") else json.load(open(os.path.expanduser(raw)))
+    creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/firebase.messaging"])
+    return creds, info["project_id"]
+
+
+def notify_approved(report: dict) -> int:
+    """Runs as a background task after approval. Returns the number of messages accepted by FCM."""
+    if not settings().firebase_credentials:
+        log.info("push not configured; skipped notification for report %s", report["id"])
+        return 0
+    try:
+        import google.auth.transport.requests
+        creds, project = _credentials()
+        creds.refresh(google.auth.transport.requests.Request())
+        devices = (db().table("devices").select("device_hash,push_token,notify_categories,"
+                   "only_nearby,approx_lat,approx_lng").not_.is_("push_token", "null").limit(10000).execute().data)
+        targets = select_targets(devices, report)
+        title = f"{label(report)} reported"
+        body = report.get("location_name") or "Mauritius"
+        sent = 0
+        with httpx.Client(timeout=10) as http:
+            for d in targets:
+                r = http.post(f"https://fcm.googleapis.com/v1/projects/{project}/messages:send",
+                              headers={"Authorization": f"Bearer {creds.token}"},
+                              json={"message": {"token": d["push_token"], "notification": {"title": title, "body": body},
+                                                "data": {"report_id": report["id"]}, "android": {"priority": "high"}}})
+                if r.status_code == 200:
+                    sent += 1
+                elif r.status_code in (400, 404) and ("UNREGISTERED" in r.text or "INVALID_ARGUMENT" in r.text):
+                    db().table("devices").update({"push_token": None}).eq("device_hash", d["device_hash"]).execute()
+                else:
+                    log.warning("FCM %s: %s", r.status_code, r.text[:200])
+        log.info("push for report %s: %d/%d sent", report["id"], sent, len(targets))
+        return sent
+    except Exception:
+        log.exception("push notification failed for report %s", report.get("id"))
+        return 0
+
+"""HTTP API. Browsing needs no account; sending a report needs a citizen account (NID sign-in);
+/api/admin/* need an admin session token."""
+from __future__ import annotations
+
+import uuid
+from datetime import timedelta
+from typing import Literal
+
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, Query, Request, Response, UploadFile
+from pydantic import BaseModel, Field
+
+from . import push
+from .core import (Admin, ApiError, User, burn_password_time, check_password, client_ip, current_admin, current_user, db,
+                   device_hash, hash_password, issue_admin_token, issue_challenge, issue_user_token, limiter, load_admin, log,
+                   nid_hash, nid_masked, optional_user, require, revoke, settings, supabase_password_login, user_from_row,
+                   validate_nid, verify_human, verify_password, USER_COLS)
+from .rules import (CATEGORIES, CURRENT_HOURS, DUPLICATE_KM, STATUSES, TOWNS, admin_item, clean_text, distance_km,
+                    in_mauritius, label, match_town, now_utc, observed_at_from_hhmm, parse_ts, photo_paths, process_photo,
+                    public_item, remove_photos, signed_urls, store_photo)
+from .translate import LANGS, translate_many
+
+router = APIRouter(prefix="/api")
+PHOTO_COLS = "report_photos(id,storage_path,mime_type,size_bytes,width,height,created_at)"
+ADMIN_COLS = f"*,{PHOTO_COLS},users(full_name,nid_masked,role)"
+PUBLIC_URL_TTL, ADMIN_URL_TTL = 3600, 900
+# What a reviewer confirms before publishing. The dashboard shows the same list (ConfirmActionModal.jsx).
+CHECKLIST = ("photo", "location", "category", "content", "not_duplicate", "current")
+LOCKOUT_AFTER, LOCKOUT_MIN = 5, 15
+REPORT_RADIUS_KM = 0.5  # a report's location must be this close to the reporter's own position
+
+
+def _public_rows(category: str | None = None, report_id: str | None = None):
+    since = (now_utc() - timedelta(hours=CURRENT_HOURS)).isoformat()
+    q = (db().table("reports").select(f"*,{PHOTO_COLS}").eq("status", "approved").gte("approved_at", since)
+         .is_("duplicate_of", "null"))
+    if category:
+        q = q.eq("category", category)
+    if report_id:
+        q = q.eq("id", report_id)
+    return q.order("approved_at", desc=True).limit(500).execute().data
+
+
+def _validate_category(category: str, custom: str | None) -> tuple[str, str | None]:
+    if category not in CATEGORIES:
+        raise ApiError(422, "validation_error", "Choose an incident type.", [{"field": "category", "message": f"one of {', '.join(CATEGORIES)}"}])
+    if category == "Other":
+        return category, clean_text(custom, "Incident description", 60, required=True)
+    return category, None
+
+
+def _validate_point(lat, lng) -> None:
+    if not in_mauritius(lat, lng):
+        raise ApiError(422, "outside_mauritius", "The incident location must be in Mauritius.",
+                       [{"field": "latitude/longitude", "message": "outside Mauritius"}])
+
+
+def _translate_items(items: list[dict], lang: str | None) -> None:
+    """Adds the description (and an "Other" incident name) in the reader's language. The original stays
+    available as description_original."""
+    if not lang or lang not in LANGS or not items:
+        return
+    texts = [i["description"] for i in items] + [i["custom_category"] for i in items if i.get("custom_category")]
+    tr = translate_many(texts, lang)
+    for i in items:
+        d = i["description"]
+        if d and tr.get(d, d) != d:
+            i["description_original"], i["description"], i["translated"] = d, tr[d], True
+        c = i.get("custom_category")
+        if c and tr.get(c, c) != c:
+            i["label"], i["translated"] = tr[c], True
+
+
+# ================================================================ public
+@router.get("/health")
+def health():
+    try:
+        db().table("reports").select("id").limit(1).execute()
+        return {"status": "ok", "database": "ok"}
+    except Exception as exc:
+        log.error("health check failed: %s", exc)
+        raise ApiError(503, "database_unavailable", "The database is not reachable.")
+
+
+@router.get("/reports")
+def list_public(response: Response, category: str | None = None, town: str | None = None,
+                source: Literal["citizen", "police"] | None = None, lang: str | None = None,
+                near_lat: float | None = None, near_lng: float | None = None, radius_km: float = Query(10, gt=0, le=60)):
+    """Approved reports published in the last 20 hours (one per incident: merged duplicates are hidden)."""
+    if category and category not in CATEGORIES:
+        raise ApiError(422, "validation_error", "Unknown incident type.")
+    now = now_utc()
+    rows = _public_rows(category)
+    urls = signed_urls(photo_paths(rows), PUBLIC_URL_TTL)
+    items = [public_item(r, now, urls) for r in rows]
+    if town:
+        items = [i for i in items if i["town"] == town]
+    if source:
+        items = [i for i in items if i["source"] == source]
+    if near_lat is not None and near_lng is not None:
+        _validate_point(near_lat, near_lng)
+        items = [i for i in items if distance_km(near_lat, near_lng, i["latitude"], i["longitude"]) <= radius_km]
+    _translate_items(items, lang)
+    response.headers["Cache-Control"] = "no-store"
+    return {"server_time": now.isoformat(), "rules": {"current_hours": CURRENT_HOURS, "older_hours": 12},
+            "reports": items}
+
+
+@router.get("/reports/mine")
+def my_reports(x_device_id: str | None = Header(default=None), user: User | None = Depends(optional_user)):
+    """Status of the reports this account (or, signed out, this device) sent in the last 30 days."""
+    h = device_hash(x_device_id)
+    if not user and not h:
+        raise ApiError(400, "device_id_required", "X-Device-Id header with a UUID is required.")
+    since = (now_utc() - timedelta(days=30)).isoformat()
+    q = db().table("reports").select("id,category,custom_category,location_name,status,created_at,duplicate_of")
+    q = q.eq("user_id", user.id) if user else q.eq("reporter_hash", h)
+    rows = q.gte("created_at", since).order("created_at", desc=True).limit(20).execute().data
+    shown = {"pending": "pending", "approved": "approved", "rejected": "not published",
+             "resolved": "resolved", "archived": "not published"}
+    return {"reports": [{"id": r["id"], "label": label(r), "category": r["category"], "location_name": r["location_name"],
+                         "status": shown[r["status"]], "merged": bool(r.get("duplicate_of")),
+                         "created_at": r["created_at"]} for r in rows]}
+
+
+@router.get("/reports/{report_id}")
+def get_public(report_id: uuid.UUID, lang: str | None = None):
+    now = now_utc()
+    rows = _public_rows(report_id=str(report_id))
+    if not rows:
+        raise ApiError(404, "not_found", "This incident is not available.")
+    item = public_item(rows[0], now, signed_urls(photo_paths(rows), PUBLIC_URL_TTL))
+    _translate_items([item], lang)
+    return {"report": item}
+
+
+def _duplicate_candidates(category: str, custom: str | None, lat: float, lng: float) -> list[dict]:
+    """Open incidents (pending or published) of the same type within 500 m, published first, nearest first."""
+    now = now_utc()
+    since = now - timedelta(hours=CURRENT_HOURS)
+    rows = (db().table("reports").select("id,status,category,custom_category,location_name,latitude,longitude,created_at,approved_at")
+            .in_("status", ["pending", "approved"]).is_("duplicate_of", "null").eq("category", category)
+            .gte("created_at", (now - timedelta(days=7)).isoformat()).limit(500).execute().data)
+    out = []
+    for r in rows:
+        fresh = parse_ts(r["approved_at"]) >= since if r["status"] == "approved" and r.get("approved_at") else parse_ts(r["created_at"]) >= since
+        if not fresh:
+            continue
+        if category == "Other" and (r.get("custom_category") or "").strip().lower() != (custom or "").strip().lower():
+            continue
+        km = distance_km(lat, lng, float(r["latitude"]), float(r["longitude"]))
+        if km <= DUPLICATE_KM:
+            out.append({**r, "km": km})
+    return sorted(out, key=lambda r: (r["status"] != "approved", r["km"]))
+
+
+@router.post("/reports", status_code=201)
+def submit_report(
+    request: Request,
+    response: Response,
+    category: str = Form(...),
+    custom_category: str | None = Form(None),
+    description: str | None = Form(None),
+    location_name: str = Form(...),
+    town: str | None = Form(None),
+    latitude: float = Form(...),
+    longitude: float = Form(...),
+    observed_time: str = Form(...),
+    client_ref: uuid.UUID | None = Form(None),
+    confirm_distinct: bool = Form(False),
+    merge_into: uuid.UUID | None = Form(None),
+    my_latitude: float | None = Form(None),
+    my_longitude: float | None = Form(None),
+    photo: UploadFile = File(...),
+    x_device_id: str | None = Header(default=None),
+    x_human_proof: str | None = Header(default=None),
+    user: User = Depends(current_user),
+):
+    """Saves a report as PENDING. It becomes public only after an administrator approves it. A report of an
+    incident that is already open nearby is merged into it, so reviewers see one incident with every photo."""
+    dev = device_hash(x_device_id)
+    limiter.hit(f"submit:ip:{client_ip(request)}", 30, 3600)
+    limiter.hit(f"submit:user:{user.id}", 6, 600)
+    limiter.hit(f"submit:user-day:{user.id}", 30, 86400)
+
+    category, custom = _validate_category(category, custom_category)
+    _validate_point(latitude, longitude)
+    # The incident must be within 500 m of where the reporter is when sending.
+    if my_latitude is None or my_longitude is None or not in_mauritius(my_latitude, my_longitude):
+        raise ApiError(422, "location_required", "Your current location in Mauritius is needed to send a report.",
+                       [{"field": "my_latitude/my_longitude", "message": "required"}])
+    if distance_km(my_latitude, my_longitude, latitude, longitude) > REPORT_RADIUS_KM:
+        raise ApiError(422, "too_far", "The incident location must be within 500 m of where you are now.",
+                       [{"field": "latitude/longitude", "message": "more than 500 m from your location"}])
+    location = clean_text(location_name, "Location", 160, required=True)
+    desc = clean_text(description, "Description", 500, multiline=True)
+    observed_at = observed_at_from_hhmm(observed_time)
+    town = town if town in TOWNS else match_town(location)
+
+    if client_ref:  # the app resends the same client_ref when retrying after a network error
+        existing = db().table("reports").select("id,status,created_at,category,custom_category,user_id,duplicate_of") \
+            .eq("client_ref", str(client_ref)).limit(1).execute().data
+        if existing and existing[0].get("user_id") == user.id:
+            response.status_code = 200
+            e = existing[0]
+            return {"report": {"id": e["id"], "status": e["status"], "label": label(e), "created_at": e["created_at"],
+                               "merged": bool(e.get("duplicate_of"))}, "already_received": True}
+        if existing:
+            raise ApiError(409, "client_ref_in_use", "This submission reference was already used.")
+
+    verify_human(x_human_proof, "report")
+
+    duplicate_of = None
+    if not confirm_distinct:
+        cands = _duplicate_candidates(category, custom, latitude, longitude)
+        target = next((c for c in cands if merge_into and c["id"] == str(merge_into)), None)
+        if target:
+            duplicate_of = target["id"]
+        elif cands and cands[0]["status"] == "approved" and not merge_into:
+            c = cands[0]
+            raise ApiError(409, "possible_duplicate",
+                           f"{label(c)} was already reported {round(c['km'] * 1000)} m away at {c.get('location_name') or 'this location'}.",
+                           {"existing": {"id": c["id"], "label": label(c), "location_name": c.get("location_name"),
+                                         "distance_m": round(c["km"] * 1000)}})
+        elif cands:
+            duplicate_of = cands[0]["id"]  # same incident, still being reviewed: merge quietly
+
+    limit = settings().max_upload_bytes
+    data = photo.file.read(limit + 1)
+    if len(data) > limit:
+        raise ApiError(413, "photo_too_large", f"The photo is larger than {limit // (1024 * 1024)} MB.")
+    processed = process_photo(data)
+
+    path = store_photo(processed)
+    row = {
+        "title": f"{custom or category} - {location}"[:200], "category": category, "custom_category": custom,
+        "description": desc or "", "latitude": latitude, "longitude": longitude, "location_name": location,
+        "town": town, "observed_time": observed_time.strip(), "observed_at": observed_at.isoformat(),
+        "status": "pending", "reporter_hash": dev, "user_id": user.id,
+        "source": "police" if user.role == "police" else "citizen", "duplicate_of": duplicate_of,
+        "client_ref": str(client_ref) if client_ref else None,
+    }
+    try:
+        rep = db().table("reports").insert(row).execute().data[0]
+    except Exception:
+        remove_photos([path])
+        raise
+    try:
+        db().table("report_photos").insert({"report_id": rep["id"], "storage_path": path, "mime_type": "image/jpeg",
+                                            "size_bytes": len(processed.data), "width": processed.width,
+                                            "height": processed.height, "sha256": processed.sha256}).execute()
+    except Exception:
+        db().table("reports").delete().eq("id", rep["id"]).execute()
+        remove_photos([path])
+        raise
+    log.info("report %s submitted (pending%s)", rep["id"], f", merged into {duplicate_of}" if duplicate_of else "")
+    return {"report": {"id": rep["id"], "status": "pending", "label": label(rep), "created_at": rep["created_at"],
+                       "merged": bool(duplicate_of)}}
+
+
+class FeedbackIn(BaseModel):
+    still_there: bool
+
+
+@router.post("/reports/{report_id}/feedback")
+def report_feedback(report_id: uuid.UUID, body: FeedbackIn, request: Request,
+                    x_device_id: str | None = Header(default=None), user: User | None = Depends(optional_user)):
+    """"Is it still there?" answer from someone passing near a published incident. One answer per person."""
+    h = device_hash(x_device_id)
+    voter = f"u:{user.id}" if user else f"d:{h}" if h else None
+    if not voter:
+        raise ApiError(400, "device_id_required", "X-Device-Id header with a UUID is required.")
+    limiter.hit(f"feedback:{voter}", 30, 3600)
+    limiter.hit(f"feedback:ip:{client_ip(request)}", 120, 3600)
+    if not _public_rows(report_id=str(report_id)):
+        raise ApiError(404, "not_found", "This incident is no longer published.")
+    db().table("report_feedback").upsert({"report_id": str(report_id), "voter": voter, "still_there": body.still_there,
+                                          "created_at": now_utc().isoformat()}, on_conflict="report_id,voter").execute()
+    return {"recorded": True}
+
+
+# ================================================================ citizen accounts
+@router.get("/auth/challenge")
+def human_challenge(request: Request, purpose: Literal["register", "report", "login"]):
+    limiter.hit(f"challenge:ip:{client_ip(request)}", 120, 600)
+    return issue_challenge(purpose)
+
+
+class RegisterIn(BaseModel):
+    nid: str = Field(..., max_length=32)
+    full_name: str = Field(..., max_length=120)
+    phone: str | None = Field(None, max_length=32)
+    password: str = Field(..., max_length=200)
+
+
+@router.post("/auth/register", status_code=201)
+def register(body: RegisterIn, request: Request, x_human_proof: str | None = Header(default=None)):
+    limiter.hit(f"register:ip:{client_ip(request)}", 10, 3600)
+    nid = validate_nid(body.nid)
+    name = clean_text(body.full_name, "Full name", 80, required=True)
+    if len(name) < 2 or not any(ch.isalpha() for ch in name):
+        raise ApiError(422, "validation_error", "Enter your full name.", [{"field": "full_name", "message": "required"}])
+    phone = None
+    if body.phone and body.phone.strip():
+        digits = "".join(ch for ch in body.phone if ch.isdigit())
+        digits = digits[3:] if digits.startswith("230") and len(digits) > 8 else digits
+        if not 7 <= len(digits) <= 8:
+            raise ApiError(422, "validation_error", "Enter a 7 or 8 digit Mauritius phone number.", [{"field": "phone", "message": "format"}])
+        phone = "+230 " + digits
+    check_password(body.password, nid)
+    verify_human(x_human_proof, "register")
+    h = nid_hash(nid)
+    taken = ApiError(409, "nid_registered", "An account with this NID already exists. Sign in instead.")
+    if db().table("users").select("id").eq("nid_hash", h).limit(1).execute().data:
+        raise taken
+    try:
+        row = db().table("users").insert({"nid_hash": h, "nid_masked": nid_masked(nid), "full_name": name, "phone": phone,
+                                          "password_hash": hash_password(body.password),
+                                          "last_login_at": now_utc().isoformat()}).execute().data[0]
+    except Exception as exc:
+        if "duplicate" in str(exc).lower() or "23505" in str(exc):
+            raise taken
+        raise
+    log.info("citizen account %s created", row["id"])
+    return issue_user_token(user_from_row(row))
+
+
+class LoginNidIn(BaseModel):
+    nid: str = Field(..., max_length=32)
+    password: str = Field(..., min_length=1, max_length=200)
+
+
+@router.post("/auth/login")
+def citizen_login(body: LoginNidIn, request: Request, x_human_proof: str | None = Header(default=None)):
+    limiter.hit(f"ulogin:ip:{client_ip(request)}", 30, 900)
+    nid = validate_nid(body.nid)
+    h = nid_hash(nid)
+    limiter.hit(f"ulogin:nid:{h}", 10, 900)
+    verify_human(x_human_proof, "login")
+    wrong = ApiError(401, "invalid_credentials", "NID number or password is incorrect.")
+    rows = db().table("users").select(f"{USER_COLS},password_hash,failed_logins,locked_until").eq("nid_hash", h).limit(1).execute().data
+    if not rows:
+        burn_password_time(body.password)
+        raise wrong
+    u = rows[0]
+    now = now_utc()
+    if u.get("locked_until") and parse_ts(u["locked_until"]) > now:
+        mins = max(1, round((parse_ts(u["locked_until"]) - now).total_seconds() / 60))
+        raise ApiError(429, "account_locked", f"Too many wrong passwords. Try again in {mins} minute{'s' if mins > 1 else ''}.")
+    if not verify_password(body.password, u["password_hash"]):
+        fails = (u.get("failed_logins") or 0) + 1
+        patch = {"failed_logins": fails}
+        if fails >= LOCKOUT_AFTER:
+            patch = {"failed_logins": 0, "locked_until": (now + timedelta(minutes=LOCKOUT_MIN)).isoformat()}
+        db().table("users").update(patch).eq("id", u["id"]).execute()
+        raise wrong
+    if u.get("disabled"):
+        raise ApiError(403, "account_disabled", "This account has been disabled. Contact MoriSafe support.")
+    db().table("users").update({"failed_logins": 0, "locked_until": None, "last_login_at": now.isoformat()}).eq("id", u["id"]).execute()
+    return issue_user_token(user_from_row(u))
+
+
+@router.get("/auth/me")
+def citizen_me(user: User = Depends(current_user)):
+    return {"user": user.public()}
+
+
+# ================================================================ devices (notification preferences)
+class DeviceIn(BaseModel):
+    push_token: str | None = Field(None, max_length=4096)
+    platform: Literal["android", "ios", "web"] | None = None
+    categories: list[str] | None = Field(None, max_length=10)
+    only_nearby: bool = False
+    latitude: float | None = None
+    longitude: float | None = None
+    language: str | None = Field(None, max_length=32)
+
+
+@router.put("/devices")
+def register_device(body: DeviceIn, request: Request, x_device_id: str | None = Header(default=None)):
+    h = device_hash(x_device_id)
+    if not h:
+        raise ApiError(400, "device_id_required", "X-Device-Id header with a UUID is required.")
+    limiter.hit(f"device:{h}", 30, 3600)
+    limiter.hit(f"device:ip:{client_ip(request)}", 120, 3600)
+    cats = None if body.categories is None else [c for c in CATEGORIES if c in body.categories]
+    near = body.only_nearby and in_mauritius(body.latitude, body.longitude)
+    row = {"device_hash": h, "push_token": body.push_token, "platform": body.platform, "notify_categories": cats,
+           "only_nearby": body.only_nearby, "approx_lat": round(body.latitude, 2) if near else None,
+           "approx_lng": round(body.longitude, 2) if near else None, "language": body.language,
+           "updated_at": now_utc().isoformat()}
+    if body.push_token:  # a token moves with the phone: drop it from any older registration
+        db().table("devices").update({"push_token": None}).eq("push_token", body.push_token).neq("device_hash", h).execute()
+    db().table("devices").upsert(row, on_conflict="device_hash").execute()
+    return {"registered": True, "push": bool(body.push_token), "push_server_configured": bool(settings().firebase_credentials)}
+
+
+@router.delete("/devices", status_code=204)
+def forget_device(x_device_id: str | None = Header(default=None)):
+    h = device_hash(x_device_id)
+    if not h:
+        raise ApiError(400, "device_id_required", "X-Device-Id header with a UUID is required.")
+    db().table("devices").delete().eq("device_hash", h).execute()
+    return Response(status_code=204)
+
+
+# ================================================================ admin
+class LoginIn(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=1, max_length=200)
+
+
+@router.post("/admin/login")
+def admin_login(body: LoginIn, request: Request):
+    email = body.email.strip().lower()
+    limiter.hit(f"login:ip:{client_ip(request)}", 30, 900)
+    limiter.hit(f"login:email:{email}", 8, 900)
+    user_id = supabase_password_login(email, body.password)
+    if not user_id:
+        raise ApiError(401, "invalid_credentials", "Email or password is incorrect.")
+    admin = load_admin(user_id)
+    if admin is None:
+        log.warning("login by non-admin account %s", user_id)
+        raise ApiError(403, "not_admin", "This account is not an administrator.")
+    _audit(admin, None, "login")
+    return issue_admin_token(admin)
+
+
+@router.post("/admin/logout", status_code=204)
+def admin_logout(authorization: str | None = Header(default=None)):
+    revoke(authorization)
+    return Response(status_code=204)
+
+
+@router.get("/admin/me")
+def admin_me(admin: Admin = Depends(current_admin)):
+    return {"admin": admin.public()}
+
+
+def _audit(admin: Admin, report_id, action: str, old_status=None, new_status=None, changes=None) -> None:
+    try:
+        db().table("report_audit").insert({"report_id": str(report_id) if report_id else None, "admin_id": admin.id,
+                                           "admin_email": admin.email, "action": action, "old_status": old_status,
+                                           "new_status": new_status, "changes": changes}).execute()
+    except Exception as exc:  # the action itself already succeeded; never fail it over the log
+        log.error("audit write failed (%s %s): %s", action, report_id, exc)
+
+
+def _get_row(report_id) -> dict:
+    rows = db().table("reports").select(ADMIN_COLS).eq("id", str(report_id)).limit(1).execute().data
+    if not rows:
+        raise ApiError(404, "not_found", "Report not found. It may have been deleted.")
+    return rows[0]
+
+
+def _children(report_id) -> list[dict]:
+    return db().table("reports").select(ADMIN_COLS).eq("duplicate_of", str(report_id)).order("created_at").execute().data
+
+
+def _feedback(ids: list[str]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if not ids:
+        return out
+    for i in range(0, len(ids), 150):
+        for f in db().table("report_feedback").select("report_id,still_there").in_("report_id", ids[i:i + 150]).execute().data:
+            c = out.setdefault(f["report_id"], {"still_there": 0, "gone": 0})
+            c["still_there" if f["still_there"] else "gone"] += 1
+    return out
+
+
+def _group_items(rows: list[dict], urls: dict[str, str]) -> list[dict]:
+    """One item per incident: merged duplicates are nested under the report they were merged into."""
+    ids = {r["id"] for r in rows}
+    kids: dict[str, list[dict]] = {}
+    tops = []
+    for r in rows:
+        if r.get("duplicate_of") and r["duplicate_of"] in ids:
+            kids.setdefault(r["duplicate_of"], []).append(r)
+        else:
+            tops.append(r)
+    fb = _feedback([r["id"] for r in tops if r["status"] == "approved"])
+    items = []
+    for r in tops:
+        item = admin_item(r, urls)
+        dups = sorted(kids.get(r["id"], []), key=lambda x: x["created_at"])
+        item["duplicates"] = [admin_item(d, urls) for d in dups]
+        item["pending_duplicates"] = sum(1 for d in dups if d["status"] == "pending")
+        item["feedback"] = fb.get(r["id"], {"still_there": 0, "gone": 0})
+        items.append(item)
+    return items
+
+
+@router.get("/admin/reports")
+def admin_list(status: str | None = None, admin: Admin = Depends(require("read"))):
+    if status and status not in STATUSES:
+        raise ApiError(422, "validation_error", "Unknown status.")
+    q = db().table("reports").select(ADMIN_COLS)
+    rows = q.order("created_at", desc=True).limit(2000).execute().data
+    urls = signed_urls(photo_paths(rows), ADMIN_URL_TTL)
+    items = _group_items(rows, urls)
+    if status:
+        items = [i for i in items if i["status"] == status or (status == "pending" and i["pending_duplicates"])]
+    stats = {s: sum(1 for i in items if i["status"] == s) for s in STATUSES}
+    return {"server_time": now_utc().isoformat(), "reports": items, "stats": {"total": len(items), **stats},
+            "checklist": list(CHECKLIST)}
+
+
+def _detail(report_id) -> dict:
+    row = _get_row(report_id)
+    rows = [row] + _children(report_id)
+    item = _group_items(rows, signed_urls(photo_paths(rows), ADMIN_URL_TTL))[0]
+    return item
+
+
+@router.get("/admin/reports/{report_id}")
+def admin_get(report_id: uuid.UUID, admin: Admin = Depends(require("read"))):
+    item = _detail(report_id)
+    ids = [item["id"]] + [d["id"] for d in item["duplicates"]]
+    audit = (db().table("report_audit").select("id,report_id,action,admin_email,old_status,new_status,changes,created_at")
+             .in_("report_id", ids).order("created_at", desc=True).limit(100).execute().data)
+    return {"report": item, "audit": audit}
+
+
+class EditIn(BaseModel):
+    category: str | None = None
+    custom_category: str | None = None
+    description: str | None = None
+    location_name: str | None = None
+    town: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    observed_time: str | None = None
+
+
+@router.patch("/admin/reports/{report_id}")
+def admin_edit(report_id: uuid.UUID, body: EditIn, admin: Admin = Depends(require("edit"))):
+    row = _get_row(report_id)
+    fields = body.model_dump(exclude_unset=True)
+    patch: dict = {}
+    if "category" in fields or "custom_category" in fields:
+        cat = fields.get("category") or row["category"]
+        cat, custom = _validate_category(cat, fields.get("custom_category", row.get("custom_category")))
+        patch.update(category=cat, custom_category=custom)
+    if "description" in fields:
+        patch["description"] = clean_text(fields["description"], "Description", 500, multiline=True) or ""
+    if "location_name" in fields:
+        patch["location_name"] = clean_text(fields["location_name"], "Location", 160, required=True)
+    if "latitude" in fields or "longitude" in fields:
+        lat, lng = fields.get("latitude", row["latitude"]), fields.get("longitude", row["longitude"])
+        _validate_point(lat, lng)
+        patch.update(latitude=float(lat), longitude=float(lng))
+    if "town" in fields:
+        patch["town"] = fields["town"] if fields["town"] in TOWNS else "Other"
+    elif "location_name" in patch:
+        patch["town"] = match_town(patch["location_name"])
+    if fields.get("observed_time"):
+        patch["observed_at"] = observed_at_from_hhmm(fields["observed_time"], parse_ts(row["created_at"])).isoformat()
+        patch["observed_time"] = fields["observed_time"].strip()
+    changes = {k: {"from": row.get(k), "to": v} for k, v in patch.items()
+               if str(row.get(k)) != str(v) and k != "observed_at"}
+    if not changes:
+        return {"report": _detail(report_id), "changed": False}
+    merged = {**row, **patch}
+    patch["title"] = f"{label(merged)} - {merged.get('location_name') or 'Mauritius'}"[:200]
+    db().table("reports").update(patch).eq("id", str(report_id)).execute()
+    _audit(admin, report_id, "edit", row["status"], row["status"], changes)
+    return {"report": _detail(report_id), "changed": True}
+
+
+class StatusIn(BaseModel):
+    status: Literal["pending", "approved", "rejected", "resolved", "archived"]
+    reason: str | None = Field(None, max_length=300)
+    checklist: dict[str, bool] | None = None
+
+
+def _remove_group(admin: Admin, row: dict, action: str) -> int:
+    """Deletes an incident with every report merged into it: photo objects first (no orphans), then the rows.
+    The audit entry stays."""
+    kids = _children(row["id"])
+    remove_photos(photo_paths([row] + kids), strict=True)
+    if kids:
+        db().table("reports").delete().in_("id", [k["id"] for k in kids]).execute()
+    db().table("reports").delete().eq("id", row["id"]).execute()
+    _audit(admin, row["id"], action, row["status"], None,
+           {"label": label(row), "location_name": row.get("location_name"), "created_at": row["created_at"],
+            "merged_reports": len(kids)})
+    return 1 + len(kids)
+
+
+@router.patch("/admin/reports/{report_id}/status")
+def admin_status(report_id: uuid.UUID, body: StatusIn, background: BackgroundTasks, admin: Admin = Depends(require("review"))):
+    row = _get_row(report_id)
+    if row.get("duplicate_of"):
+        raise ApiError(409, "is_duplicate", "This report is merged into another incident. Review that incident, or unmerge this report first.")
+    if body.status == "resolved":  # the incident is over: remove it (and its merged reports) completely
+        n = _remove_group(admin, row, "resolve")
+        return {"report": None, "deleted": True, "removed": n}
+    if row["status"] == body.status:
+        raise ApiError(409, "unchanged", f"This report is already {body.status}.")
+    now = now_utc().isoformat()
+    patch = {"status": body.status, "reviewed_by": admin.id, "reviewed_at": now}
+    changes = None
+    if body.status == "rejected":
+        patch["rejection_reason"] = clean_text(body.reason, "Rejection reason", 300, required=True)
+        changes = {"reason": patch["rejection_reason"]}
+    if body.status == "approved":
+        missing = [k for k in CHECKLIST if not (body.checklist or {}).get(k)]
+        if missing:
+            raise ApiError(422, "checklist_incomplete", "Complete the review checklist before approving.", {"missing": missing})
+        _validate_point(row["latitude"], row["longitude"])
+        patch.update(approved_at=now, rejection_reason=None)  # publication starts the 20-hour window
+        changes = {"checklist": "complete"}
+    db().table("reports").update(patch).eq("id", str(report_id)).eq("status", row["status"]).execute()
+    fresh = _get_row(report_id)
+    if fresh["status"] != body.status:
+        raise ApiError(409, "conflict", "Another administrator changed this report at the same time. Reload and try again.")
+    db().table("reports").update(patch).eq("duplicate_of", str(report_id)).execute()  # merged reports follow
+    _audit(admin, report_id, "status", row["status"], body.status, changes)
+    if body.status == "approved":
+        background.add_task(push.notify_approved, fresh)
+    return {"report": _detail(report_id)}
+
+
+@router.delete("/admin/reports/{report_id}", status_code=204)
+def admin_delete(report_id: uuid.UUID, admin: Admin = Depends(require("delete"))):
+    """Permanent: removes the incident, every report merged into it and their photos. The audit entry stays."""
+    _remove_group(admin, _get_row(report_id), "delete")
+    return Response(status_code=204)
+
+
+class MergeIn(BaseModel):
+    into: uuid.UUID
+
+
+@router.post("/admin/reports/{report_id}/merge")
+def admin_merge(report_id: uuid.UUID, body: MergeIn, admin: Admin = Depends(require("edit"))):
+    """Marks a report (and anything merged into it) as a duplicate of another incident."""
+    if report_id == body.into:
+        raise ApiError(422, "validation_error", "A report cannot be merged into itself.")
+    row, target = _get_row(report_id), _get_row(body.into)
+    if target.get("duplicate_of"):
+        target = _get_row(target["duplicate_of"])
+    if target["id"] == row["id"]:
+        raise ApiError(422, "validation_error", "These reports are already in the same incident.")
+    db().table("reports").update({"duplicate_of": target["id"]}).eq("duplicate_of", row["id"]).execute()
+    db().table("reports").update({"duplicate_of": target["id"]}).eq("id", row["id"]).execute()
+    _audit(admin, row["id"], "merge", row["status"], row["status"], {"into": target["id"]})
+    return {"report": _detail(target["id"])}
+
+
+@router.post("/admin/reports/{report_id}/unmerge")
+def admin_unmerge(report_id: uuid.UUID, admin: Admin = Depends(require("edit"))):
+    """Splits a merged report back out as its own incident, waiting for review."""
+    row = _get_row(report_id)
+    if not row.get("duplicate_of"):
+        raise ApiError(409, "not_merged", "This report is not merged into another incident.")
+    db().table("reports").update({"duplicate_of": None, "status": "pending", "approved_at": None}).eq("id", row["id"]).execute()
+    _audit(admin, row["id"], "unmerge", row["status"], "pending", {"from": row["duplicate_of"]})
+    return {"report": _detail(row["id"])}
+
+
+# ================================================================ admin: administrators (Settings page)
+ADMIN_ROLES = ("viewer", "moderator", "admin", "superadmin")
+
+
+def _gotrue(method: str, path: str, **kw):
+    """Supabase Auth admin API with the service key (never changes the shared client's session)."""
+    import httpx
+    s = settings()
+    try:
+        return httpx.request(method, f"{s.supabase_url}/auth/v1{path}", timeout=15,
+                             headers={"apikey": s.service_key, "Authorization": f"Bearer {s.service_key}"}, **kw)
+    except httpx.HTTPError as exc:
+        log.error("supabase auth admin unreachable: %s", exc)
+        raise ApiError(502, "auth_unavailable", "The sign-in service is unavailable. Try again shortly.")
+
+
+def _auth_users() -> dict[str, dict]:
+    r = _gotrue("GET", "/admin/users", params={"page": 1, "per_page": 1000})
+    if r.status_code != 200:
+        return {}
+    return {u["id"]: u for u in r.json().get("users", [])}
+
+
+@router.get("/admin/admins")
+def admin_admins(admin: Admin = Depends(require("read"))):
+    rows = db().table("admins").select("user_id,email,full_name,role,created_at").order("created_at").execute().data
+    auth = _auth_users()
+    return {"admins": [{**r, "role": r.get("role") or "admin", "email": r.get("email") or auth.get(r["user_id"], {}).get("email"),
+                        "last_sign_in_at": auth.get(r["user_id"], {}).get("last_sign_in_at"), "you": r["user_id"] == admin.id}
+                       for r in rows],
+            "roles": {"viewer": "Read only", "moderator": "Review and edit, cannot delete", "admin": "Everything, including accounts",
+                      "superadmin": "Everything, including accounts"}}
+
+
+class AdminCreateIn(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    full_name: str | None = Field(None, max_length=80)
+    password: str | None = Field(None, max_length=200)
+    role: Literal["viewer", "moderator", "admin", "superadmin"] = "moderator"
+
+
+@router.post("/admin/admins", status_code=201)
+def admin_add(body: AdminCreateIn, admin: Admin = Depends(require("users"))):
+    """Gives someone dashboard access. A new email gets a Supabase sign-in with the password given here;
+    an existing Supabase user keeps their current password."""
+    import re as _re
+    email = body.email.strip().lower()
+    if not _re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise ApiError(422, "validation_error", "Enter a valid email address.", [{"field": "email", "message": "format"}])
+    if body.role == "superadmin" and admin.role != "superadmin":
+        raise ApiError(403, "forbidden", "Only a superadmin can add another superadmin.")
+    name = clean_text(body.full_name, "Full name", 80) if body.full_name else None
+    existing = next((u for u in _auth_users().values() if (u.get("email") or "").lower() == email), None)
+    if existing:
+        uid = existing["id"]
+    else:
+        pw = body.password or ""
+        if len(pw) < 10 or not _re.search(r"[A-Za-z]", pw) or not _re.search(r"\d", pw):
+            raise ApiError(422, "weak_password", "Give the new administrator a password of at least 10 characters with letters and a number.",
+                           [{"field": "password", "message": "weak"}])
+        r = _gotrue("POST", "/admin/users", json={"email": email, "password": pw, "email_confirm": True,
+                                                 "user_metadata": {"full_name": name} if name else {}})
+        if r.status_code not in (200, 201):
+            log.warning("create auth user failed %s: %s", r.status_code, r.text[:200])
+            raise ApiError(422, "auth_create_failed", "Supabase could not create this sign-in. Check the email and password.")
+        uid = r.json()["id"]
+    if db().table("admins").select("user_id").eq("user_id", uid).limit(1).execute().data:
+        raise ApiError(409, "already_admin", "This person is already an administrator.")
+    db().table("admins").insert({"user_id": uid, "email": email, "full_name": name, "role": body.role}).execute()
+    _audit(admin, None, "admin_add", None, None, {"email": email, "role": body.role, "new_sign_in": not existing})
+    return {"admin": {"user_id": uid, "email": email, "full_name": name, "role": body.role}, "new_sign_in": not existing}
+
+
+class AdminRoleIn(BaseModel):
+    role: Literal["viewer", "moderator", "admin", "superadmin"]
+
+
+def _other_admin(user_id: uuid.UUID, admin: Admin) -> dict:
+    if str(user_id) == admin.id:
+        raise ApiError(409, "self", "You cannot change or remove your own administrator access.")
+    rows = db().table("admins").select("user_id,email,role").eq("user_id", str(user_id)).limit(1).execute().data
+    if not rows:
+        raise ApiError(404, "not_found", "Administrator not found.")
+    if (rows[0].get("role") == "superadmin") and admin.role != "superadmin":
+        raise ApiError(403, "forbidden", "Only a superadmin can change another superadmin.")
+    return rows[0]
+
+
+@router.patch("/admin/admins/{user_id}")
+def admin_role(user_id: uuid.UUID, body: AdminRoleIn, admin: Admin = Depends(require("users"))):
+    row = _other_admin(user_id, admin)
+    if body.role == "superadmin" and admin.role != "superadmin":
+        raise ApiError(403, "forbidden", "Only a superadmin can make someone a superadmin.")
+    db().table("admins").update({"role": body.role}).eq("user_id", str(user_id)).execute()
+    _audit(admin, None, "admin_role", None, None, {"email": row.get("email"), "from": row.get("role"), "to": body.role})
+    return {"updated": True}
+
+
+@router.delete("/admin/admins/{user_id}", status_code=204)
+def admin_remove(user_id: uuid.UUID, admin: Admin = Depends(require("users"))):
+    """Removes dashboard access only. The person's Supabase sign-in is kept (they lose access immediately)."""
+    row = _other_admin(user_id, admin)
+    db().table("admins").delete().eq("user_id", str(user_id)).execute()
+    _audit(admin, None, "admin_remove", None, None, {"email": row.get("email"), "role": row.get("role")})
+    return Response(status_code=204)
+
+
+@router.get("/admin/audit")
+def admin_audit(limit: int = Query(20, ge=1, le=100), admin: Admin = Depends(require("read"))):
+    """Recent administrator actions across all reports (dashboard activity feed). Sign-ins are left out."""
+    rows = (db().table("report_audit").select("id,report_id,action,admin_email,old_status,new_status,changes,created_at")
+            .neq("action", "login").order("created_at", desc=True).limit(limit).execute().data)
+    return {"audit": rows}
+
+
+# ================================================================ admin: citizen accounts
+@router.get("/admin/users")
+def admin_users(admin: Admin = Depends(require("read"))):
+    users = (db().table("users").select("id,full_name,nid_masked,phone,role,disabled,created_at,last_login_at")
+             .order("created_at", desc=True).limit(2000).execute().data)
+    counts: dict[str, int] = {}
+    for r in db().table("reports").select("user_id").not_.is_("user_id", "null").limit(10000).execute().data:
+        counts[r["user_id"]] = counts.get(r["user_id"], 0) + 1
+    return {"users": [{**u, "reports": counts.get(u["id"], 0)} for u in users]}
+
+
+class UserPatch(BaseModel):
+    """Admins can only enable or disable an account. The role (citizen or police) is not editable here."""
+    model_config = {"extra": "forbid"}
+    disabled: bool | None = None
+
+
+@router.patch("/admin/users/{user_id}")
+def admin_user_update(user_id: uuid.UUID, body: UserPatch, admin: Admin = Depends(require("users"))):
+    patch = body.model_dump(exclude_none=True)
+    if not patch:
+        raise ApiError(422, "validation_error", "Nothing to change.")
+    rows = db().table("users").select("id,role,disabled").eq("id", str(user_id)).limit(1).execute().data
+    if not rows:
+        raise ApiError(404, "not_found", "Account not found.")
+    db().table("users").update(patch).eq("id", str(user_id)).execute()
+    _audit(admin, None, "user", None, None, {"user_id": str(user_id), **{k: {"from": rows[0].get(k), "to": v} for k, v in patch.items()}})
+    return {"user": db().table("users").select("id,full_name,nid_masked,phone,role,disabled,created_at,last_login_at")
+            .eq("id", str(user_id)).limit(1).execute().data[0]}
+
+"""Incident rules carried over from the prototype, photo processing, storage and serialisation."""
+from __future__ import annotations
+
+import hashlib
+import io
+import math
+import re
+import unicodedata
+import uuid
+import warnings
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+from .core import ApiError, db, log, settings
+
+try:  # HEIC/HEIF from iPhones and some Android phones
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF = True
+except ImportError:  # pragma: no cover
+    HEIF = False
+
+MU_TZ = ZoneInfo("Indian/Mauritius")
+CATEGORIES = ("Falling debris", "Accident", "Fire", "Flooding", "Other")
+STATUSES = ("pending", "approved", "rejected", "resolved", "archived")
+SOURCES = ("citizen", "police")
+TOWNS = ("Port Louis", "Curepipe", "Quatre Bornes", "Vacoas-Phoenix", "Rose Hill", "Beau Bassin", "Mahébourg",
+         "Flic en Flac", "Grand Baie", "Triolet", "Goodlands", "Moka", "Centre de Flacq", "Saint Pierre", "Souillac")
+LAT_MIN, LAT_MAX, LNG_MIN, LNG_MAX = -20.65, -19.85, 57.18, 58.1  # same box as the DB constraint
+CURRENT_HOURS, OLDER_HOURS = 20, 12   # public for 20 h after approval, dimmed after 12 h
+DUPLICATE_KM, NEAR_KM = 0.5, 10
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_ts(v) -> datetime | None:
+    return datetime.fromisoformat(v) if isinstance(v, str) and v else v
+
+
+def in_mauritius(lat, lng) -> bool:
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(lat) and math.isfinite(lng) and LAT_MIN <= lat <= LAT_MAX and LNG_MIN <= lng <= LNG_MAX
+
+
+def distance_km(lat1, lng1, lat2, lng2) -> float:
+    r = math.pi / 180
+    h = math.sin((lat2 - lat1) * r / 2) ** 2 + math.cos(lat1 * r) * math.cos(lat2 * r) * math.sin((lng2 - lng1) * r / 2) ** 2
+    return 6371 * 2 * math.atan2(math.sqrt(h), math.sqrt(1 - h))
+
+
+def _norm(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").lower()
+
+
+def match_town(name: str | None) -> str:
+    """Same rule as the prototype's matchTown()."""
+    if not name:
+        return "Other"
+    x = _norm(name)
+    return next((t for t in TOWNS if _norm(t) in x or (len(x) > 3 and x in _norm(t))), "Other")
+
+
+def clean_text(value, field: str, max_len: int, required: bool = False, multiline: bool = False) -> str | None:
+    """Strips control characters. Clients HTML-escape on output; the API stores plain text."""
+    s = "" if value is None else str(value)
+    s = "".join(ch for ch in s if ch in ("\n",) and multiline or unicodedata.category(ch)[0] != "C")
+    s = re.sub(r"[ \t]+", " ", s).strip() if not multiline else re.sub(r"\n{3,}", "\n\n", s).strip()
+    if required and not s:
+        raise ApiError(422, "validation_error", f"{field} is required.", [{"field": field, "message": "required"}])
+    if len(s) > max_len:
+        raise ApiError(422, "validation_error", f"{field} must be {max_len} characters or fewer.",
+                       [{"field": field, "message": f"max {max_len} characters"}])
+    return s or None
+
+
+def observed_at_from_hhmm(hhmm: str, now: datetime | None = None) -> datetime:
+    """'HH:MM' Mauritius time -> the latest such moment at or before now (23:59 sent at 00:30 = yesterday)."""
+    m = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", (hhmm or "").strip())
+    if not m:
+        raise ApiError(422, "validation_error", "Time observed must be HH:MM.", [{"field": "observed_time", "message": "HH:MM"}])
+    local_now = (now or now_utc()).astimezone(MU_TZ)
+    t = local_now.replace(hour=int(m[1]), minute=int(m[2]), second=0, microsecond=0)
+    if t > local_now:
+        t -= timedelta(days=1)
+    return t.astimezone(timezone.utc)
+
+
+def label(row: dict) -> str:
+    return (row.get("custom_category") if row.get("category") == "Other" and row.get("custom_category") else row.get("category")) or "Incident"
+
+
+# ---------------------------------------------------------------- photos
+ALLOWED_FORMATS = {"JPEG", "MPO", "PNG", "WEBP", "HEIF"}
+MAX_PIXELS = 50_000_000
+MAX_EDGE = 1600
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS
+
+
+@dataclass
+class Photo:
+    data: bytes
+    width: int
+    height: int
+    sha256: str
+
+
+def process_photo(data: bytes) -> Photo:
+    """Decodes the real file contents (the filename and declared type are ignored), rejects anything that
+    is not a photo, applies EXIF rotation, then re-encodes as a fresh JPEG with no metadata, which also
+    removes the camera's GPS tags and anything appended to the file."""
+    if len(data) < 64:
+        raise ApiError(422, "invalid_photo", "The photo is empty or damaged. Choose another photo.")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as probe:
+                fmt = probe.format
+                probe.verify()
+            if fmt not in ALLOWED_FORMATS:
+                raise ApiError(415, "unsupported_photo_type", "Photos must be JPEG, PNG, WebP or HEIC.")
+            img = Image.open(io.BytesIO(data))
+            img.load()
+    except ApiError:
+        raise
+    except (UnidentifiedImageError, Image.DecompressionBombError, Image.DecompressionBombWarning, OSError, SyntaxError, ValueError):
+        raise ApiError(415, "unsupported_photo_type", "That file is not a photo we can read. Use a JPEG, PNG, WebP or HEIC photo.")
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.getchannel("A"))
+        img = bg
+    img = img.convert("RGB")
+    img.thumbnail((MAX_EDGE, MAX_EDGE), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=82, optimize=True)
+    raw = out.getvalue()
+    return Photo(raw, img.width, img.height, hashlib.sha256(raw).hexdigest())
+
+
+def store_photo(photo: Photo) -> str:
+    path = f"{now_utc():%Y/%m}/{uuid.uuid4().hex}.jpg"
+    try:
+        db().storage.from_(settings().photo_bucket).upload(path, photo.data, {"content-type": "image/jpeg", "cache-control": "3600"})
+    except Exception as exc:
+        log.error("photo upload failed: %s", exc)
+        raise ApiError(502, "storage_unavailable", "The photo could not be saved. Your report was not sent. Try again.")
+    return path
+
+
+def remove_photos(paths: list[str], strict: bool = False) -> None:
+    if not paths:
+        return
+    try:
+        db().storage.from_(settings().photo_bucket).remove(paths)
+    except Exception as exc:
+        log.error("photo removal failed for %s: %s", paths, exc)
+        if strict:
+            raise ApiError(502, "storage_unavailable", "The photo could not be removed from storage, so nothing was deleted. Try again.")
+
+
+def signed_urls(paths: list[str], expires_s: int) -> dict[str, str]:
+    paths = [p for p in dict.fromkeys(paths) if p]
+    if not paths:
+        return {}
+    try:
+        res = db().storage.from_(settings().photo_bucket).create_signed_urls(paths, expires_s)
+    except Exception as exc:
+        log.error("signing photo URLs failed: %s", exc)
+        return {}
+    return {r["path"]: r["signedURL"] for r in res if r.get("signedURL") and not r.get("error")}
+
+
+# ---------------------------------------------------------------- serialisation
+def photo_paths(rows: list[dict]) -> list[str]:
+    return [p["storage_path"] for r in rows for p in (r.get("report_photos") or [])]
+
+
+def public_item(row: dict, now: datetime, urls: dict[str, str]) -> dict:
+    pub = parse_ts(row["approved_at"])
+    photos = row.get("report_photos") or []
+    return {
+        "id": row["id"], "category": row["category"], "custom_category": row.get("custom_category"),
+        "label": label(row), "source": row.get("source") or "citizen", "description": row.get("description") or "",
+        "location_name": row.get("location_name") or "", "town": row.get("town") or match_town(row.get("location_name")),
+        "latitude": float(row["latitude"]), "longitude": float(row["longitude"]),
+        "observed_time": row.get("observed_time"), "observed_at": row.get("observed_at"),
+        "published_at": row["approved_at"], "expires_at": (pub + timedelta(hours=CURRENT_HOURS)).isoformat(),
+        "older": now - pub >= timedelta(hours=OLDER_HOURS), "updated_at": row.get("updated_at"),
+        "photo_url": urls.get(photos[0]["storage_path"]) if photos else None,
+    }
+
+
+def admin_item(row: dict, urls: dict[str, str]) -> dict:
+    photos = [{"id": p["id"], "url": urls.get(p["storage_path"]), "mime_type": p.get("mime_type"),
+               "size_bytes": p.get("size_bytes"), "width": p.get("width"), "height": p.get("height")}
+              for p in (row.get("report_photos") or [])]
+    return {
+        "id": row["id"], "title": f"{label(row)} - {row.get('location_name') or 'Mauritius'}", "label": label(row),
+        "category": row["category"], "custom_category": row.get("custom_category"), "source": row.get("source") or "citizen",
+        "description": row.get("description") or "", "location_name": row.get("location_name") or "",
+        "town": row.get("town") or "Other", "latitude": float(row["latitude"]), "longitude": float(row["longitude"]),
+        "observed_time": row.get("observed_time"), "observed_at": row.get("observed_at"), "status": row["status"],
+        "created_at": row["created_at"], "updated_at": row.get("updated_at"), "approved_at": row.get("approved_at"),
+        "reviewed_at": row.get("reviewed_at"), "rejection_reason": row.get("rejection_reason"),
+        "reporter_ref": (row.get("reporter_hash") or "")[:8] or None,
+        "reporter": ({"name": u.get("full_name"), "nid_masked": u.get("nid_masked"), "role": u.get("role")}
+                     if (u := row.get("users")) else None),
+        "duplicate_of": row.get("duplicate_of"),
+        "photos": photos, "image_url": photos[0]["url"] if photos else None,
+    }
+
+-- ============================================================
+-- LOCAL TEST STACK ONLY. Never run this against Supabase.
+-- Recreates the parts of a Supabase project that MoriSafe touches, so the
+-- real migrations can be applied and tested with PostgreSQL + PostgREST:
+--   roles anon / authenticated / service_role (BYPASSRLS),
+--   Supabase's default grants on schema public,
+--   auth.users + auth.uid(), storage.buckets + storage.objects.
+-- ============================================================
+create extension if not exists pgcrypto;
+
+do $$ begin
+  if not exists (select from pg_roles where rolname = 'anon') then create role anon nologin noinherit; end if;
+  if not exists (select from pg_roles where rolname = 'authenticated') then create role authenticated nologin noinherit; end if;
+  if not exists (select from pg_roles where rolname = 'service_role') then create role service_role nologin noinherit bypassrls; end if;
+  if not exists (select from pg_roles where rolname = 'authenticator') then create role authenticator login noinherit password 'authenticator-local-only'; end if;
+end $$;
+grant anon, authenticated, service_role to authenticator;
+
+-- Supabase grants everything in public to the API roles and relies on RLS.
+grant usage on schema public to anon, authenticated, service_role;
+alter default privileges in schema public grant all on tables to anon, authenticated, service_role;
+alter default privileges in schema public grant all on sequences to anon, authenticated, service_role;
+alter default privileges in schema public grant all on functions to anon, authenticated, service_role;
+
+create schema if not exists auth;
+create table if not exists auth.users (
+  id                 uuid primary key default gen_random_uuid(),
+  email              text unique,
+  encrypted_password text,
+  email_confirmed_at timestamptz default now(),
+  created_at         timestamptz not null default now()
+);
+create or replace function auth.uid() returns uuid language sql stable as $$
+  select coalesce(
+    nullif(current_setting('request.jwt.claim.sub', true), ''),
+    (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')
+  )::uuid
+$$;
+grant usage on schema auth to anon, authenticated, service_role;
+grant select on auth.users to service_role;
+grant execute on function auth.uid() to anon, authenticated, service_role;
+
+create schema if not exists storage;
+create table if not exists storage.buckets (
+  id                 text primary key,
+  name               text not null,
+  public             boolean default false,
+  file_size_limit    bigint,
+  allowed_mime_types text[],
+  created_at         timestamptz default now()
+);
+create table if not exists storage.objects (
+  id         uuid primary key default gen_random_uuid(),
+  bucket_id  text references storage.buckets(id),
+  name       text,
+  owner      uuid,
+  metadata   jsonb,
+  created_at timestamptz default now()
+);
+alter table storage.objects enable row level security;
+grant usage on schema storage to anon, authenticated, service_role;
+grant all on all tables in schema storage to anon, authenticated, service_role;
+
+"""
+LOCAL TEST STACK ONLY. A stand-in for a Supabase project's HTTP API so the
+MoriSafe server can be tested end to end without network access to Supabase.
+
+  /rest/v1/*     -> proxied to a real PostgREST (the software Supabase runs)
+  /auth/v1/*     -> minimal GoTrue: password grant against auth.users (bcrypt)
+  /storage/v1/*  -> minimal storage-api: upload, signed URLs, public URLs, delete
+
+Bucket privacy, size limit, allowed MIME types and storage.objects INSERT
+policies are read from the database on every request, so tests see the real
+effect of the SQL migrations. Not a security boundary: never deploy this.
+"""
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+
+import httpx
+import jwt
+import psycopg
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
+
+JWT_SECRET = os.environ["DEVSTACK_JWT_SECRET"]
+POSTGREST = os.environ.get("DEVSTACK_POSTGREST", "http://127.0.0.1:3000")
+DB_DSN = os.environ.get("DEVSTACK_DB", "postgresql://postgres@127.0.0.1:5432/morisafe")
+FILES = Path(os.environ.get("DEVSTACK_FILES", "/tmp/devstack-storage"))
+FILES.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="fake-supabase (tests only)")
+_http = httpx.Client(timeout=30)
+
+
+def db():
+    return psycopg.connect(DB_DSN, autocommit=True)
+
+
+def role_of(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else request.headers.get("apikey", "")
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False}).get("role", "anon")
+    except jwt.PyJWTError:
+        return "invalid"
+
+
+def storage_error(status: int, error: str, message: str) -> JSONResponse:
+    return JSONResponse({"statusCode": str(status), "error": error, "message": message}, status_code=status)
+
+
+@app.api_route("/rest/v1/{path:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE", "HEAD"])
+async def rest(path: str, request: Request):
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length", "apikey")}
+    if "authorization" not in {k.lower() for k in headers} and request.headers.get("apikey"):
+        headers["Authorization"] = "Bearer " + request.headers["apikey"]
+    r = _http.request(request.method, f"{POSTGREST}/{path}", params=request.query_params.multi_items(),
+                      headers=headers, content=await request.body())
+    keep = {k: v for k, v in r.headers.items() if k.lower() in ("content-type", "content-range", "preference-applied", "location")}
+    return Response(r.content, status_code=r.status_code, headers=keep)
+
+
+@app.post("/auth/v1/token")
+async def token(request: Request):
+    if request.query_params.get("grant_type") != "password":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    if role_of(request) == "invalid":
+        return JSONResponse({"message": "Invalid API key"}, status_code=401)
+    body = await request.json()
+    email, password = (body.get("email") or "").strip().lower(), body.get("password") or ""
+    with db() as c:
+        row = c.execute("select id::text, email from auth.users where lower(email) = %s "
+                        "and encrypted_password = crypt(%s, encrypted_password)", (email, password)).fetchone()
+    if not row:
+        return JSONResponse({"error": "invalid_grant", "error_description": "Invalid login credentials"}, status_code=400)
+    now = int(time.time())
+    access = jwt.encode({"sub": row[0], "email": row[1], "role": "authenticated", "aud": "authenticated",
+                         "iat": now, "exp": now + 3600}, JWT_SECRET, algorithm="HS256")
+    return {"access_token": access, "token_type": "bearer", "expires_in": 3600, "refresh_token": uuid.uuid4().hex,
+            "user": {"id": row[0], "email": row[1], "aud": "authenticated", "role": "authenticated"}}
+
+
+def bucket(bucket_id: str):
+    with db() as c:
+        return c.execute("select public, file_size_limit, allowed_mime_types from storage.buckets where id = %s",
+                         (bucket_id,)).fetchone()
+
+
+def insert_allowed(role: str, bucket_id: str) -> bool:
+    """Approximates storage RLS: an INSERT policy on storage.objects for this role and bucket."""
+    with db() as c:
+        rows = c.execute("select roles, coalesce(with_check, '') from pg_policies where schemaname = 'storage' "
+                         "and tablename = 'objects' and cmd in ('INSERT', 'ALL')").fetchall()
+    return any((role in roles or "public" in roles) and f"'{bucket_id}'" in check for roles, check in rows)
+
+
+def safe_path(bucket_id: str, name: str) -> Path:
+    root = (FILES / bucket_id).resolve()
+    p = (root / name).resolve()
+    if not str(p).startswith(str(root) + os.sep):
+        raise ValueError("path traversal")
+    return p
+
+
+def serve_file(p: Path):
+    meta = json.loads(p.with_name(p.name + ".meta").read_text())
+    return FileResponse(p, media_type=meta["content_type"])
+
+
+@app.post("/storage/v1/object/sign/{bucket_id}")
+async def sign_many(bucket_id: str, request: Request):
+    if role_of(request) != "service_role":
+        return storage_error(403, "Unauthorized", "new row violates row-level security policy")
+    body = await request.json()
+    expires = int(body.get("expiresIn", 60))
+    out = []
+    for name in body.get("paths", []):
+        if not safe_path(bucket_id, name).exists():
+            out.append({"error": "Either the object does not exist or you do not have access to it", "path": name, "signedURL": None})
+            continue
+        tok = jwt.encode({"url": f"{bucket_id}/{name}", "exp": int(time.time()) + expires}, JWT_SECRET, algorithm="HS256")
+        out.append({"error": None, "path": name, "signedURL": f"/object/sign/{bucket_id}/{name}?token={tok}"})
+    return out
+
+
+@app.get("/storage/v1/object/sign/{bucket_id}/{name:path}")
+async def signed_download(bucket_id: str, name: str, token: str = ""):
+    try:
+        claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        return storage_error(400, "InvalidJWT", '"exp" claim timestamp check failed')
+    except jwt.PyJWTError:
+        return storage_error(400, "InvalidJWT", "invalid signature")
+    if claims.get("url") != f"{bucket_id}/{name}":
+        return storage_error(400, "InvalidSignature", "The url do not match the signature")
+    p = safe_path(bucket_id, name)
+    return serve_file(p) if p.exists() else storage_error(404, "not_found", "Object not found")
+
+
+@app.get("/storage/v1/object/public/{bucket_id}/{name:path}")
+async def public_download(bucket_id: str, name: str):
+    b = bucket(bucket_id)
+    if not b or not b[0]:
+        return storage_error(400, "not_found", "Bucket not found")
+    p = safe_path(bucket_id, name)
+    return serve_file(p) if p.exists() else storage_error(404, "not_found", "Object not found")
+
+
+@app.post("/storage/v1/object/{bucket_id}/{name:path}")
+async def upload(bucket_id: str, name: str, request: Request):
+    role = role_of(request)
+    if role == "invalid":
+        return storage_error(400, "InvalidJWT", "invalid signature")
+    b = bucket(bucket_id)
+    if not b:
+        return storage_error(404, "Bucket not found", "Bucket not found")
+    if role != "service_role" and not insert_allowed(role, bucket_id):
+        return storage_error(403, "Unauthorized", "new row violates row-level security policy")
+    form = await request.form()
+    part = form.get("file")
+    data = await part.read()
+    ctype = part.content_type or "application/octet-stream"
+    _, size_limit, allowed = b
+    if size_limit and len(data) > size_limit:
+        return storage_error(413, "Payload too large", "The object exceeded the maximum allowed size")
+    if allowed and ctype not in allowed:
+        return storage_error(415, "invalid_mime_type", f"mime type {ctype} is not supported")
+    p = safe_path(bucket_id, name)
+    if p.exists():
+        return storage_error(409, "Duplicate", "The resource already exists")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    p.with_name(p.name + ".meta").write_text(json.dumps({"content_type": ctype}))
+    with db() as c:
+        c.execute("insert into storage.objects (bucket_id, name, metadata) values (%s, %s, %s)",
+                  (bucket_id, name, json.dumps({"mimetype": ctype, "size": len(data)})))
+    return {"Key": f"{bucket_id}/{name}", "Id": str(uuid.uuid4())}
+
+
+@app.delete("/storage/v1/object/{bucket_id}")
+async def remove(bucket_id: str, request: Request):
+    if role_of(request) != "service_role":
+        return storage_error(403, "Unauthorized", "new row violates row-level security policy")
+    names = (await request.json()).get("prefixes", [])
+    removed = []
+    for name in names:
+        p = safe_path(bucket_id, name)
+        if p.exists():
+            p.unlink()
+            p.with_name(p.name + ".meta").unlink(missing_ok=True)
+            removed.append({"name": name, "bucket_id": bucket_id})
+    with db() as c:
+        c.execute("delete from storage.objects where bucket_id = %s and name = any(%s)", (bucket_id, names))
+    return removed
+
+#!/usr/bin/env bash
+# LOCAL TEST STACK ONLY. Recreates the "morisafe" database the way the live
+# Supabase project looks today (000 + rows shaped like the prototype's), then
+# applies 001 twice to prove it is idempotent. Then start devstack/serve.sh.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SERVER="$(dirname "$HERE")"
+PGBIN=/usr/lib/postgresql/16/bin
+PGDATA=${PGDATA:-/tmp/pgdata}
+FILES=${DEVSTACK_FILES:-/tmp/devstack-storage}
+PSQL="psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -q -X"
+export DEVSTACK_JWT_SECRET="local-devstack-secret-that-is-at-least-32-chars"
+
+if [ ! -f "$PGDATA/PG_VERSION" ]; then
+  mkdir -p "$PGDATA" && chown postgres:postgres "$PGDATA"
+  su postgres -c "$PGBIN/initdb -D $PGDATA -A trust -U postgres" >/dev/null
+fi
+if ! su postgres -c "$PGBIN/pg_ctl -D $PGDATA status" >/dev/null 2>&1; then
+  su postgres -c "$PGBIN/pg_ctl -D $PGDATA -o '-p 5432 -k /tmp -c listen_addresses=127.0.0.1' -l /tmp/pg.log start" >/dev/null
+  sleep 2
+fi
+$PSQL -d postgres -c "drop database if exists morisafe with (force)" -c "create database morisafe" </dev/null
+
+$PSQL -d morisafe -f "$HERE/bootstrap.sql" </dev/null
+$PSQL -d morisafe -f "$SERVER/migrations/000_existing_schema.sql" </dev/null
+
+# Rows shaped exactly like the ones the prototype inserted with the anon key.
+$PSQL -d morisafe </dev/null <<'SQL'
+insert into auth.users (id, email, encrypted_password) values
+  ('11111111-1111-4111-8111-111111111111', 'admin@morisafe.test',   crypt('Admin-Pass-123',   gen_salt('bf'))),
+  ('22222222-2222-4222-8222-222222222222', 'citizen@morisafe.test', crypt('Citizen-Pass-123', gen_salt('bf'))),
+  ('33333333-3333-4333-8333-333333333333', 'viewer@morisafe.test',  crypt('Viewer-Pass-123',  gen_salt('bf')));
+insert into public.admins (user_id, full_name, email, role) values
+  ('11111111-1111-4111-8111-111111111111', 'Test Admin',  'admin@morisafe.test',  'admin'),
+  ('33333333-3333-4333-8333-333333333333', 'Test Viewer', 'viewer@morisafe.test', 'viewer');
+insert into public.reports
+  (id, title, category, description, latitude, longitude, location_name, image_url, status, created_at, approved_at, observed_time)
+values
+  ('aaaaaaaa-0000-4000-8000-000000000001', 'Fallen tree on road - Curepipe', 'Fallen tree on road',
+   'Legacy row: custom category and public photo URL', -20.3181, 57.5237, 'Royal Road, Curepipe',
+   'https://example.supabase.co/storage/v1/object/public/report-photos/legacy-1.jpg', 'approved',
+   now() - interval '2 hours', null, '09:15'),
+  ('aaaaaaaa-0000-4000-8000-000000000002', 'Flooding - Port Louis', 'Flooding', '', -20.1609, 57.5012,
+   'Port Louis', null, 'pending', '2026-11-13 20:30:00+00', null, '23:59'),
+  ('aaaaaaaa-0000-4000-8000-000000000003', 'Fire - Triolet', 'Fire', 'Smoke seen', -20.0572, 57.5486,
+   'Triolet', null, 'rejected', now() - interval '3 hours', null, 'not a time');
+insert into storage.objects (bucket_id, name) values ('report-photos', 'legacy-1.jpg');
+SQL
+
+rm -rf "$FILES" && mkdir -p "$FILES/report-photos"
+python3 - "$FILES" <<'PY'
+import sys, json
+from PIL import Image
+p = f"{sys.argv[1]}/report-photos/legacy-1.jpg"
+Image.new("RGB", (64, 48), (200, 80, 40)).save(p, "JPEG")
+open(p + ".meta", "w").write(json.dumps({"content_type": "image/jpeg"}))
+PY
+
+# The migration under test, twice.
+$PSQL -d morisafe -f "$SERVER/migrations/001_api_gateway.sql" </dev/null
+$PSQL -d morisafe -f "$SERVER/migrations/001_api_gateway.sql" </dev/null
+echo "001 applied twice without error"
+
+read -r SERVICE_KEY ANON_KEY < <(python3 - <<'PY'
+import jwt, os, time
+s = os.environ["DEVSTACK_JWT_SECRET"]; now = int(time.time())
+mk = lambda role: jwt.encode({"iss": "supabase", "ref": "localdev", "role": role, "iat": now, "exp": now + 10 * 365 * 86400}, s, algorithm="HS256")
+print(mk("service_role"), mk("anon"))
+PY
+)
+cat > "$HERE/postgrest.conf" <<EOF
+db-uri = "postgres://authenticator:authenticator-local-only@127.0.0.1:5432/morisafe"
+db-schemas = "public"
+db-anon-role = "anon"
+jwt-secret = "$DEVSTACK_JWT_SECRET"
+server-port = 3000
+EOF
+cat > "$HERE/.env.devstack" <<EOF
+SUPABASE_URL=http://127.0.0.1:54321
+SUPABASE_SERVICE_ROLE_KEY=$SERVICE_KEY
+DEVSTACK_ANON_KEY=$ANON_KEY
+DEVSTACK_JWT_SECRET=$DEVSTACK_JWT_SECRET
+DEVSTACK_FILES=$FILES
+APP_SECRET=devstack-app-secret-not-for-production-0123456789
+ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174
+EOF
+echo "database ready; now run devstack/serve.sh"
+
+#!/usr/bin/env bash
+# LOCAL TEST STACK ONLY. Runs PostgREST (:3000) and the fake Supabase gateway
+# (:54321) in the foreground until stopped. Run devstack/reset_db.sh first.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+set -a; . "$HERE/.env.devstack"; set +a
+postgrest "$HERE/postgrest.conf" >/tmp/postgrest.log 2>&1 &
+PGRST=$!
+trap 'kill $PGRST 2>/dev/null' EXIT
+cd "$HERE" && python3 -m uvicorn fake_supabase:app --host 127.0.0.1 --port 54321 --log-level warning
+
+-- Original MoriSafe schema (morisafe-admin/supabase.sql), kept verbatim as the baseline.
+-- Already applied to the live project. Apply 001_api_gateway.sql on top of it.
+-- ============================================================
+-- MoriSafe: full database setup (safe to re-run)
+-- ============================================================
+
+-- 1. Reports table
+create table if not exists public.reports (
+  id            uuid primary key default gen_random_uuid(),
+  title         text not null,
+  category      text not null,
+  description   text,
+  latitude      numeric not null,
+  longitude     numeric not null,
+  location_name text,
+  image_url     text,
+  status        text not null default 'pending' check (status in ('pending','approved','rejected')),
+  created_at    timestamptz not null default now(),
+  rejection_reason text,
+  approved_at   timestamptz,
+  observed_time text
+);
+
+-- 2. Admins table (user_id = the admin's login id in auth.users)
+create table if not exists public.admins (
+  user_id    uuid primary key references auth.users(id) on delete cascade,
+  full_name  text,
+  email      text,
+  phone      text,
+  location   text,
+  role       text not null default 'admin',
+  created_at timestamptz not null default now()
+);
+
+-- If the table already existed with only user_id, add the new columns
+alter table public.admins
+  add column if not exists full_name  text,
+  add column if not exists email      text,
+  add column if not exists phone      text,
+  add column if not exists location   text,
+  add column if not exists role       text not null default 'admin',
+  add column if not exists created_at timestamptz not null default now();
+
+-- Fill in email for any existing admins
+update public.admins a
+set email = u.email
+from auth.users u
+where u.id = a.user_id and a.email is null;
+
+alter table public.admins enable row level security;
+
+create or replace function public.is_admin() returns boolean
+language sql security definer stable set search_path = public as
+$$ select exists (select 1 from public.admins where user_id = auth.uid()) $$;
+
+drop policy if exists "admins read admins" on public.admins;
+create policy "admins read admins" on public.admins
+  for select to authenticated using (public.is_admin());
+
+-- 3. Row level security on reports
+alter table public.reports enable row level security;
+drop policy if exists "public reads approved" on public.reports;
+drop policy if exists "admins read all"       on public.reports;
+drop policy if exists "public submits"        on public.reports;
+drop policy if exists "admins update"         on public.reports;
+drop policy if exists "admins delete"         on public.reports;
+create policy "public reads approved" on public.reports for select using (status = 'approved');
+create policy "admins read all"       on public.reports for select to authenticated using (public.is_admin());
+create policy "public submits"        on public.reports for insert to anon, authenticated with check (status = 'pending');
+create policy "admins update"         on public.reports for update to authenticated using (public.is_admin()) with check (public.is_admin());
+create policy "admins delete"         on public.reports for delete to authenticated using (public.is_admin());
+
+-- 4. Only accept locations inside Mauritius
+alter table public.reports drop constraint if exists reports_in_mauritius;
+alter table public.reports add constraint reports_in_mauritius
+  check (latitude between -20.65 and -19.85 and longitude between 57.18 and 58.1);
+
+-- 5. Photo bucket
+insert into storage.buckets (id, name, public) values ('report-photos', 'report-photos', true) on conflict do nothing;
+drop policy if exists "anyone uploads report photos" on storage.objects;
+drop policy if exists "public reads report photos"   on storage.objects;
+drop policy if exists "admins delete report photos"  on storage.objects;
+create policy "anyone uploads report photos" on storage.objects for insert to anon, authenticated with check (bucket_id = 'report-photos');
+create policy "public reads report photos"   on storage.objects for select using (bucket_id = 'report-photos');
+create policy "admins delete report photos"  on storage.objects for delete to authenticated using (bucket_id = 'report-photos' and public.is_admin());
+-- ============================================================
+-- MoriSafe 001: route everything through the API server
+-- Run in the Supabase SQL editor AFTER 000_existing_schema.sql.
+-- Safe to re-run. Never deletes report rows.
+--
+-- What changes:
+--   * reports gains custom_category, severity, town, observed_at,
+--     reviewed_by/at, updated_at, reporter_hash, client_ref
+--   * statuses: pending | approved | rejected | resolved | archived
+--   * photo metadata moves to report_photos (path + MIME + size), backfilled
+--   * report_audit (admin actions) and devices (notification preferences)
+--   * BREAKING for the old prototypes: anonymous INSERT/SELECT on reports
+--     and anonymous upload/read on the photo bucket are removed. The bucket
+--     becomes private; the API issues short-lived signed URLs instead.
+-- ============================================================
+begin;
+
+-- 1. New report columns -------------------------------------------------
+alter table public.reports
+  add column if not exists custom_category text,
+  add column if not exists severity        text,
+  add column if not exists town            text,
+  add column if not exists observed_at     timestamptz,
+  add column if not exists reviewed_by     uuid references auth.users(id) on delete set null,
+  add column if not exists reviewed_at     timestamptz,
+  add column if not exists updated_at      timestamptz not null default now(),
+  add column if not exists reporter_hash   text,
+  add column if not exists client_ref      uuid;
+
+-- 2. Statuses ------------------------------------------------------------
+alter table public.reports drop constraint if exists reports_status_check;
+alter table public.reports add constraint reports_status_check
+  check (status in ('pending', 'approved', 'rejected', 'resolved', 'archived'));
+
+-- 3. Categories: the prototype stored "Other" text directly in category --
+update public.reports
+   set custom_category = nullif(left(btrim(category), 60), ''),
+       category        = 'Other'
+ where category not in ('Falling debris', 'Accident', 'Fire', 'Flooding', 'Other');
+alter table public.reports drop constraint if exists reports_category_check;
+alter table public.reports add constraint reports_category_check
+  check (category in ('Falling debris', 'Accident', 'Fire', 'Flooding', 'Other'));
+alter table public.reports drop constraint if exists reports_custom_category_check;
+alter table public.reports add constraint reports_custom_category_check
+  check (custom_category is null or char_length(custom_category) between 1 and 60);
+
+-- 4. Severity drives the Urgent / Warning / Information notification options
+alter table public.reports alter column severity set default 'info';
+update public.reports set severity = case
+    when category in ('Fire', 'Accident')           then 'urgent'
+    when category in ('Flooding', 'Falling debris') then 'warning'
+    else 'info' end
+ where severity is null;
+alter table public.reports alter column severity set not null;
+alter table public.reports drop constraint if exists reports_severity_check;
+alter table public.reports add constraint reports_severity_check
+  check (severity in ('urgent', 'warning', 'info'));
+
+-- 5. Timestamps -----------------------------------------------------------
+update public.reports set approved_at = created_at
+ where status = 'approved' and approved_at is null;
+
+-- observed_time was 'HH:MM' Mauritius time: take the latest such moment at or
+-- before the submission time (23:59 sent at 00:30 means the previous day).
+update public.reports r set observed_at = (
+    case when ((r.created_at at time zone 'Indian/Mauritius')::date + r.observed_time::time)
+              <= (r.created_at at time zone 'Indian/Mauritius')
+         then ((r.created_at at time zone 'Indian/Mauritius')::date + r.observed_time::time)
+         else ((r.created_at at time zone 'Indian/Mauritius')::date - 1 + r.observed_time::time)
+    end) at time zone 'Indian/Mauritius'
+ where r.observed_at is null
+   and r.observed_time ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$';
+
+create or replace function public.touch_updated_at() returns trigger
+language plpgsql as $$ begin new.updated_at := now(); return new; end $$;
+drop trigger if exists reports_touch_updated_at on public.reports;
+create trigger reports_touch_updated_at before update on public.reports
+  for each row execute function public.touch_updated_at();
+
+-- 6. Photo metadata (objects are referenced by storage path, never by URL)
+create table if not exists public.report_photos (
+  id           uuid primary key default gen_random_uuid(),
+  report_id    uuid not null references public.reports(id) on delete cascade,
+  storage_path text not null unique,
+  mime_type    text not null default 'image/jpeg',
+  size_bytes   integer,
+  width        integer,
+  height       integer,
+  sha256       text,
+  created_at   timestamptz not null default now()
+);
+create index if not exists report_photos_report_id_idx on public.report_photos (report_id);
+
+-- Backfill photos the prototype uploaded (public URLs stored in image_url).
+-- image_url itself is left untouched but is no longer used by the API.
+insert into public.report_photos (report_id, storage_path, created_at)
+select r.id,
+       substring(r.image_url from '/storage/v1/object/public/report-photos/([^?#]+)'),
+       r.created_at
+  from public.reports r
+ where r.image_url ~ '/storage/v1/object/public/report-photos/[^?#]+'
+   and not exists (select 1 from public.report_photos p where p.report_id = r.id)
+on conflict (storage_path) do nothing;
+
+-- 7. Audit log. No foreign key, so history survives report deletion. ------
+create table if not exists public.report_audit (
+  id          bigint generated always as identity primary key,
+  report_id   uuid,
+  admin_id    uuid,
+  admin_email text,
+  action      text not null,
+  old_status  text,
+  new_status  text,
+  changes     jsonb,
+  created_at  timestamptz not null default now()
+);
+create index if not exists report_audit_report_idx on public.report_audit (report_id, created_at desc);
+
+-- 8. Anonymous devices for notifications --------------------------------
+--    device_hash is an HMAC of a random id the app generates; location is
+--    rounded to ~1 km and only stored when "notify me within 10 km" is on.
+create table if not exists public.devices (
+  device_hash    text primary key,
+  push_token     text unique,
+  platform       text check (platform in ('android', 'ios', 'web')),
+  notify_urgent  boolean not null default true,
+  notify_warning boolean not null default true,
+  notify_info    boolean not null default false,
+  only_nearby    boolean not null default false,
+  approx_lat     numeric(5, 2),
+  approx_lng     numeric(5, 2),
+  language       text,
+  updated_at     timestamptz not null default now()
+);
+
+-- 9. Indexes --------------------------------------------------------------
+create unique index if not exists reports_client_ref_key on public.reports (client_ref);
+create index if not exists reports_public_idx   on public.reports (status, approved_at desc);
+create index if not exists reports_created_idx  on public.reports (created_at desc);
+create index if not exists reports_reporter_idx on public.reports (reporter_hash, created_at desc);
+
+-- 10. Row level security --------------------------------------------------
+-- The API server uses the service role (bypasses RLS) and is the only writer
+-- and the only public reader. New tables get RLS with no policies at all.
+alter table public.report_photos enable row level security;
+alter table public.report_audit  enable row level security;
+alter table public.devices       enable row level security;
+
+drop policy if exists "public submits"        on public.reports;
+drop policy if exists "public reads approved" on public.reports;
+-- Kept: "admins read all", "admins update", "admins delete" (Supabase dashboard use).
+
+-- 11. Private photo bucket -----------------------------------------------
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('report-photos', 'report-photos', false, 8388608, array['image/jpeg'])
+on conflict (id) do update
+   set public = false,
+       file_size_limit = excluded.file_size_limit,
+       allowed_mime_types = excluded.allowed_mime_types;
+drop policy if exists "anyone uploads report photos" on storage.objects;
+drop policy if exists "public reads report photos"   on storage.objects;
+-- Kept: "admins delete report photos".
+
+commit;
+
+-- Ask PostgREST to pick up the new table and columns immediately.
+notify pgrst, 'reload schema';
+
+-r requirements.txt
+pytest>=8
+psycopg[binary]>=3.2
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+supabase>=2.10
+python-dotenv>=1.0
+pydantic>=2.7
+python-multipart>=0.0.9
+PyJWT>=2.8
+httpx>=0.27
+pillow>=10.4
+pillow-heif>=0.18
+google-auth>=2.30
+requests>=2.32
+
+"""Entry point, unchanged from the original project: uvicorn server:app --reload
+The application now lives in app/ (see README.md)."""
+from app.main import app  # noqa: F401
+
+"""End-to-end API tests against the local stack (PostgreSQL + PostgREST + auth/storage stand-ins).
+
+Run:  devstack/reset_db.sh  &&  (devstack/serve.sh &)  &&  python -m pytest -q
+Tests 1-6 from the brief are test_1_* ... test_6_*."""
+import io
+import os
+import time
+import uuid
+from pathlib import Path
+
+import httpx
+import jwt
+import psycopg
+import pytest
+from PIL import Image
+
+ENV = Path(__file__).resolve().parent.parent / "devstack" / ".env.devstack"
+for _line in ENV.read_text().splitlines():
+    if "=" in _line:
+        _k, _v = _line.split("=", 1)
+        os.environ[_k] = _v
+os.environ["FIREBASE_SERVICE_ACCOUNT"] = ""
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app import core  # noqa: E402
+from app.main import create_app  # noqa: E402
+from app.push import select_targets  # noqa: E402
+
+DB = "postgresql://postgres@127.0.0.1:5432/morisafe"
+URL = os.environ["SUPABASE_URL"]
+FILES = Path(os.environ["DEVSTACK_FILES"]) / "report-photos"
+ADMIN = ("admin@morisafe.test", "Admin-Pass-123")
+ADMIN_ID = "11111111-1111-4111-8111-111111111111"
+_spot = iter(range(100))
+
+
+def spot():
+    """A fresh location ~2 km from every other test's, so duplicate checks don't interfere."""
+    i = next(_spot)
+    return -20.48 + (i % 20) * 0.025, 57.40 + (i // 20) * 0.03
+
+
+def sql(q, *args):
+    with psycopg.connect(DB, autocommit=True) as c:
+        cur = c.execute(q, args or None)
+        return cur.fetchall() if cur.description else None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _clean_previous_runs():
+    """Remove reports left by an earlier test run so reruns start from the migrated seed data."""
+    sql("delete from reports where id::text not like 'aaaaaaaa%'")
+    sql("delete from devices")
+    sql("delete from report_audit")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_limits():
+    core.limiter.reset()
+
+
+@pytest.fixture(scope="module")
+def client():
+    return TestClient(create_app())
+
+
+def jpeg(size=(800, 600), color=(30, 120, 200), exif=True) -> bytes:
+    img, out = Image.new("RGB", size, color), io.BytesIO()
+    if exif:
+        ex = Image.Exif()
+        ex[0x010F] = "TestCam"   # camera make
+        ex[0x0112] = 6           # orientation: rotate 90 degrees
+        img.save(out, "JPEG", exif=ex.tobytes())
+    else:
+        img.save(out, "JPEG")
+    return out.getvalue()
+
+
+def submit(client, lat, lng, cat="Flooding", photo=None, device=None, name="p.jpg", ctype="image/jpeg", **extra):
+    data = {"category": cat, "location_name": "Royal Road, Port Louis", "latitude": str(lat), "longitude": str(lng),
+            "observed_time": "08:30", **{k: str(v) for k, v in extra.items()}}
+    files = {"photo": (name, jpeg() if photo is None else photo, ctype)}
+    return client.post("/api/reports", data=data, files=files, headers={"X-Device-Id": device or str(uuid.uuid4())})
+
+
+def login(client, creds=ADMIN):
+    r = client.post("/api/admin/login", json={"email": creds[0], "password": creds[1]})
+    assert r.status_code == 200, r.text
+    return {"Authorization": "Bearer " + r.json()["token"]}
+
+
+def set_status(client, auth, rid, status, reason=None):
+    return client.patch(f"/api/admin/reports/{rid}/status", json={"status": status, "reason": reason}, headers=auth)
+
+
+def public(client):
+    r = client.get("/api/reports")
+    assert r.status_code == 200
+    return {x["id"]: x for x in r.json()["reports"]}
+
+
+# ---------------------------------------------------------------- migration
+def test_migration_backfilled_existing_rows_and_locked_down_direct_access(client):
+    rows = {r[0]: r[1:] for r in sql("select id::text, category, custom_category, severity, approved_at is not null, "
+                                       "observed_at, status from public.reports where id::text like 'aaaaaaaa%'")}
+    assert rows["aaaaaaaa-0000-4000-8000-000000000001"][:4] == ("Other", "Fallen tree on road", "info", True)
+    flood = rows["aaaaaaaa-0000-4000-8000-000000000002"]
+    assert flood[2] == "warning"
+    # sent 00:30 Mauritius time on the 14th with "23:59" -> 23:59 on the 13th = 19:59 UTC
+    from datetime import datetime, timezone
+    assert flood[4] == datetime(2026, 11, 13, 19, 59, tzinfo=timezone.utc)
+    assert rows["aaaaaaaa-0000-4000-8000-000000000003"][2:5:2] == ("urgent", None)
+    assert sql("select storage_path from report_photos where report_id = 'aaaaaaaa-0000-4000-8000-000000000001'") == [("legacy-1.jpg",)]
+    assert sql("select public, allowed_mime_types from storage.buckets where id = 'report-photos'")[0] == (False, ["image/jpeg"])
+    policies = {r[0] for r in sql("select policyname from pg_policies where tablename in ('reports', 'objects')")}
+    assert not policies & {"public submits", "public reads approved", "anyone uploads report photos", "public reads report photos"}
+    assert {"admins read all", "admins update", "admins delete"} <= policies
+
+    # The prototype's public photo URL and its anon-key reads/writes no longer work.
+    assert httpx.get(f"{URL}/storage/v1/object/public/report-photos/legacy-1.jpg").status_code == 400
+    anon = {"apikey": os.environ["DEVSTACK_ANON_KEY"], "Authorization": "Bearer " + os.environ["DEVSTACK_ANON_KEY"]}
+    assert httpx.get(f"{URL}/rest/v1/reports?select=id", headers=anon).json() == []
+    ins = httpx.post(f"{URL}/rest/v1/reports", headers=anon, json={"title": "x", "category": "Fire", "latitude": -20.2,
+                                                                   "longitude": 57.5, "status": "pending"})
+    assert ins.status_code in (401, 403)
+
+    # The legacy approved report is public through the API, with its photo via a signed URL.
+    legacy = public(client)["aaaaaaaa-0000-4000-8000-000000000001"]
+    assert legacy["label"] == "Fallen tree on road" and legacy["older"] is False
+    assert httpx.get(legacy["photo_url"]).headers["content-type"] == "image/jpeg"
+
+
+# ---------------------------------------------------------------- brief tests 1-6
+def test_1_submitted_report_is_saved_pending_with_its_photo_and_not_public(client):
+    lat, lng = spot()
+    r = submit(client, lat, lng, description="Water across both lanes")
+    assert r.status_code == 201, r.text
+    rid = r.json()["report"]["id"]
+    assert r.json()["report"]["status"] == "pending"
+    assert sql("select status, severity, observed_time, reporter_hash is not null from reports where id = %s", rid) == \
+        [("pending", "warning", "08:30", True)]
+    path, mime, size, w, h = sql("select storage_path, mime_type, size_bytes, width, height from report_photos where report_id = %s", rid)[0]
+    stored = Image.open(FILES / path)
+    assert (mime, stored.format, (w, h), stored.size) == ("image/jpeg", "JPEG", (600, 800), (600, 800))  # EXIF rotation applied
+    assert len(stored.getexif()) == 0 and size == (FILES / path).stat().st_size  # metadata (incl. GPS) stripped
+    assert rid not in public(client)
+    assert client.get(f"/api/reports/{rid}").status_code == 404
+
+
+def test_2_and_3_admin_reviews_photo_and_location_then_approval_publishes(client):
+    lat, lng = spot()
+    rid = submit(client, lat, lng, cat="Accident").json()["report"]["id"]
+    auth = login(client)
+    listed = {x["id"]: x for x in client.get("/api/admin/reports", headers=auth).json()["reports"]}
+    item = listed[rid]
+    assert item["status"] == "pending" and (item["latitude"], item["longitude"]) == (lat, lng)
+    photo = httpx.get(item["image_url"])
+    assert photo.status_code == 200 and photo.headers["content-type"] == "image/jpeg"
+
+    r = set_status(client, auth, rid, "approved")
+    assert r.status_code == 200, r.text
+    assert sql("select status, reviewed_by::text, approved_at is not null from reports where id = %s", rid) == [("approved", ADMIN_ID, True)]
+    assert sql("select action, old_status, new_status, admin_email from report_audit where report_id = %s", rid) == \
+        [("status", "pending", "approved", "admin@morisafe.test")]
+
+    pub = public(client)[rid]
+    assert (pub["latitude"], pub["longitude"], pub["severity"], pub["older"]) == (lat, lng, "urgent", False)
+    assert httpx.get(pub["photo_url"]).status_code == 200
+    assert client.get(f"/api/reports/{rid}").json()["report"]["id"] == rid
+    assert "reporter_hash" not in pub and "reviewed_by" not in pub
+
+
+def test_4_rejected_and_resolved_reports_never_appear_publicly(client):
+    auth = login(client)
+    rid = submit(client, *spot(), cat="Fire").json()["report"]["id"]
+    assert set_status(client, auth, rid, "rejected").status_code == 422  # a reason is required
+    assert set_status(client, auth, rid, "rejected", "Not a real fire, controlled burn").status_code == 200
+    assert sql("select status, rejection_reason from reports where id = %s", rid) == [("rejected", "Not a real fire, controlled burn")]
+    assert rid not in public(client) and client.get(f"/api/reports/{rid}").status_code == 404
+
+    rid2 = submit(client, *spot(), cat="Fire").json()["report"]["id"]
+    set_status(client, auth, rid2, "approved")
+    assert rid2 in public(client)
+    assert set_status(client, auth, rid2, "resolved").status_code == 200
+    assert rid2 not in public(client)
+
+
+def test_5_reports_and_photos_persist_across_a_server_restart(client):
+    rid = submit(client, *spot()).json()["report"]["id"]
+    core.settings.cache_clear()
+    core.db.cache_clear()
+    fresh = TestClient(create_app())  # a brand-new app process: nothing in memory
+    detail = fresh.get(f"/api/admin/reports/{rid}", headers=login(fresh)).json()
+    assert detail["report"]["status"] == "pending"
+    assert httpx.get(detail["report"]["photos"][0]["url"]).status_code == 200
+
+
+def test_6_security_rejects_unauthorised_and_invalid_requests(client):
+    rid = submit(client, *spot()).json()["report"]["id"]
+    s = core.settings()
+    # no session, garbage, wrong signature, expired
+    assert client.get("/api/admin/reports").json()["error"]["code"] == "not_authenticated"
+    for token, code in [("garbage", "invalid_token"),
+                        (jwt.encode({"sub": ADMIN_ID, "typ": "morisafe-admin", "jti": "x", "exp": time.time() + 99}, "wrong-secret-wrong-secret-wrong-secret"), "invalid_token"),
+                        (jwt.encode({"sub": ADMIN_ID, "typ": "morisafe-admin", "jti": "x", "exp": time.time() - 5}, s.app_secret), "session_expired")]:
+        r = client.get("/api/admin/reports", headers={"Authorization": f"Bearer {token}"})
+        assert (r.status_code, r.json()["error"]["code"]) == (401, code)
+    # a member of the public cannot approve
+    r = client.patch(f"/api/admin/reports/{rid}/status", json={"status": "approved"})
+    assert r.status_code == 401 and sql("select status from reports where id = %s", rid) == [("pending",)]
+    # real Supabase account that is not in public.admins; wrong password
+    r = client.post("/api/admin/login", json={"email": "citizen@morisafe.test", "password": "Citizen-Pass-123"})
+    assert (r.status_code, r.json()["error"]["code"]) == (403, "not_admin")
+    r = client.post("/api/admin/login", json={"email": ADMIN[0], "password": "wrong"})
+    assert (r.status_code, r.json()["error"]["code"]) == (401, "invalid_credentials")
+    assert "token" not in r.text and "password" not in r.text.lower().replace("email or password", "")
+    # role checks: viewer can read but not approve or delete
+    viewer = login(client, ("viewer@morisafe.test", "Viewer-Pass-123"))
+    assert client.get("/api/admin/reports", headers=viewer).status_code == 200
+    assert set_status(client, viewer, rid, "approved").status_code == 403
+    assert client.delete(f"/api/admin/reports/{rid}", headers=viewer).status_code == 403
+    # removing someone from public.admins revokes access immediately
+    sql("delete from admins where email = 'viewer@morisafe.test'")
+    assert client.get("/api/admin/me", headers=viewer).json()["error"]["code"] == "not_admin"
+    sql("insert into admins (user_id, email, full_name, role) values ('33333333-3333-4333-8333-333333333333', 'viewer@morisafe.test', 'Test Viewer', 'viewer')")
+    # logout revokes the token
+    auth = login(client)
+    assert client.post("/api/admin/logout", headers=auth).status_code == 204
+    assert client.get("/api/admin/me", headers=auth).status_code == 401
+
+    # invalid uploads: text, a PHP script named .jpg, a GIF, too large
+    for payload in [b"just some text pretending to be a photo" * 10, b"<?php system($_GET['c']); ?>" * 10]:
+        r = submit(client, *spot(), photo=payload, name="evil.jpg")
+        assert (r.status_code, r.json()["error"]["code"]) == (415, "unsupported_photo_type")
+    gif = io.BytesIO()
+    Image.new("RGB", (20, 20)).save(gif, "GIF")
+    assert submit(client, *spot(), photo=gif.getvalue(), name="a.gif", ctype="image/gif").status_code == 415
+    assert submit(client, *spot(), photo=os.urandom(11 * 1024 * 1024)).json()["error"]["code"] == "photo_too_large"
+    # a real JPEG with a script appended is accepted, but only re-encoded pixels are stored
+    rid_poly = submit(client, *spot(), photo=jpeg(exif=False) + b"<?php echo 1; ?>").json()["report"]["id"]
+    path = sql("select storage_path from report_photos where report_id = %s", rid_poly)[0][0]
+    assert b"<?php" not in (FILES / path).read_bytes()
+    # invalid fields
+    assert submit(client, -20.0, 56.0).json()["error"]["code"] == "outside_mauritius"
+    assert submit(client, "nan", 57.5).status_code == 422
+    assert submit(client, *spot(), cat="Other").status_code == 422          # needs a description of the incident
+    assert submit(client, *spot(), cat="Volcano").status_code == 422
+    assert submit(client, *spot(), observed_time="25:99").status_code == 422
+    r = client.post("/api/reports", data={"category": "Fire", "location_name": "x", "latitude": "-20.2",
+                                          "longitude": "57.5", "observed_time": "08:00"})
+    assert (r.status_code, r.json()["error"]["code"]) == (422, "validation_error")   # photo missing
+    # hostile text is stored literally, never executed
+    r = submit(client, *spot(), location_name="x'); drop table reports;--", description="<script>alert(1)</script>")
+    assert r.status_code == 201 and sql("select count(*) > 0 from reports")[0][0]
+    assert sql("select description from reports where id = %s", r.json()["report"]["id"]) == [("<script>alert(1)</script>",)]
+
+
+# ---------------------------------------------------------------- incident rules
+def test_duplicate_within_500_m_asks_for_confirmation_instead_of_rejecting(client):
+    auth = login(client)
+    lat, lng = spot()
+    first = submit(client, lat, lng, cat="Fire").json()["report"]["id"]
+    set_status(client, auth, first, "approved")
+    near = submit(client, lat + 0.0018, lng, cat="Fire")  # ~200 m north
+    err = near.json()["error"]
+    assert near.status_code == 409 and err["code"] == "possible_duplicate"
+    assert err["details"]["existing"]["id"] == first and 150 < err["details"]["existing"]["distance_m"] < 250
+    assert submit(client, lat + 0.0018, lng, cat="Fire", confirm_distinct="true").status_code == 201  # a distinct fire
+    assert submit(client, lat, lng, cat="Accident").status_code == 201        # different type, same spot
+    assert submit(client, lat + 0.009, lng, cat="Fire").status_code == 201    # ~1 km away
+
+
+def test_retry_with_the_same_client_ref_does_not_create_a_second_report(client):
+    ref, device = str(uuid.uuid4()), str(uuid.uuid4())
+    lat, lng = spot()
+    a = submit(client, lat, lng, device=device, client_ref=ref)
+    b = submit(client, lat, lng, device=device, client_ref=ref)
+    assert (a.status_code, b.status_code) == (201, 200) and b.json()["already_received"] is True
+    assert a.json()["report"]["id"] == b.json()["report"]["id"]
+    assert sql("select count(*) from reports where client_ref = %s", ref) == [(1,)]
+    assert submit(client, lat, lng, client_ref=ref).status_code == 409  # someone else's reference
+
+
+def test_admin_edit_validates_corrects_coordinates_and_is_audited(client):
+    auth = login(client)
+    rid = submit(client, *spot()).json()["report"]["id"]
+    bad = client.patch(f"/api/admin/reports/{rid}", json={"latitude": -21.5}, headers=auth)
+    assert bad.json()["error"]["code"] == "outside_mauritius"
+    lat, lng = spot()
+    r = client.patch(f"/api/admin/reports/{rid}", headers=auth, json={"category": "Other", "custom_category": "Fallen power line",
+                                                                       "latitude": lat, "longitude": lng, "location_name": "Curepipe market"})
+    rep = r.json()["report"]
+    assert r.json()["changed"] and (rep["label"], rep["severity"], rep["town"], rep["latitude"]) == ("Fallen power line", "info", "Curepipe", lat)
+    changes = sql("select changes from report_audit where report_id = %s and action = 'edit'", rid)[0][0]
+    assert {"category", "custom_category", "latitude", "location_name", "town", "severity"} <= changes.keys()
+    assert "longitude" not in changes  # unchanged values are not logged
+    assert client.patch(f"/api/admin/reports/{rid}", json={"latitude": lat}, headers=auth).json()["changed"] is False
+
+
+def test_delete_removes_row_and_photo_but_keeps_the_audit_trail(client):
+    auth = login(client)
+    rid = submit(client, *spot()).json()["report"]["id"]
+    path = sql("select storage_path from report_photos where report_id = %s", rid)[0][0]
+    assert (FILES / path).exists()
+    assert client.delete(f"/api/admin/reports/{rid}", headers=auth).status_code == 204
+    assert not (FILES / path).exists()
+    assert sql("select count(*) from reports where id = %s", rid) == [(0,)]
+    assert sql("select count(*) from report_photos where report_id = %s", rid) == [(0,)]
+    assert sql("select action from report_audit where report_id = %s and action = 'delete'", rid) == [("delete",)]
+    assert client.get(f"/api/admin/reports/{rid}", headers=auth).status_code == 404
+
+
+def test_heic_and_transparent_png_are_converted_to_jpeg(client):
+    import pillow_heif
+    heic = io.BytesIO()
+    pillow_heif.from_pillow(Image.new("RGB", (400, 300), (10, 200, 10))).save(heic, quality=60)
+    png = io.BytesIO()
+    Image.new("RGBA", (300, 300), (255, 0, 0, 128)).save(png, "PNG")
+    for data, name, ctype in [(heic.getvalue(), "IMG_0001.HEIC", "image/heic"), (png.getvalue(), "a.png", "image/png")]:
+        r = submit(client, *spot(), photo=data, name=name, ctype=ctype)
+        assert r.status_code == 201, r.text
+        path = sql("select storage_path from report_photos where report_id = %s", r.json()["report"]["id"])[0][0]
+        assert Image.open(FILES / path).format == "JPEG"
+
+
+def test_public_window_is_20_hours_and_older_than_12_hours_is_flagged(client):
+    auth = login(client)
+    rid = submit(client, *spot(), cat="Falling debris").json()["report"]["id"]
+    set_status(client, auth, rid, "approved")
+    sql("update reports set approved_at = now() - interval '13 hours' where id = %s", rid)
+    assert public(client)[rid]["older"] is True
+    sql("update reports set approved_at = now() - interval '21 hours' where id = %s", rid)
+    assert rid not in public(client)
+    near = client.get("/api/reports", params={"near_lat": -20.16, "near_lng": 57.50, "radius_km": 5}).json()["reports"]
+    assert all(abs(x["latitude"] + 20.16) < 0.1 for x in near)
+
+
+def test_rate_limits_submissions_and_logins(client):
+    device = str(uuid.uuid4())
+    codes = [submit(client, -20.0, 56.0, device=device).status_code for _ in range(7)]
+    assert codes[:6] == [422] * 6 and codes[6] == 429
+    r = submit(client, -20.0, 56.0, device=device)
+    assert int(r.headers["retry-after"]) > 0
+    codes = [client.post("/api/admin/login", json={"email": "x@y.z", "password": "no"}).status_code for _ in range(9)]
+    assert codes[-1] == 429
+
+
+def test_device_sees_its_own_report_statuses_only(client):
+    device = str(uuid.uuid4())
+    rid = submit(client, *spot(), device=device).json()["report"]["id"]
+    mine = client.get("/api/reports/mine", headers={"X-Device-Id": device}).json()["reports"]
+    assert [(m["id"], m["status"]) for m in mine] == [(rid, "pending")]
+    assert client.get("/api/reports/mine", headers={"X-Device-Id": str(uuid.uuid4())}).json()["reports"] == []
+
+
+def test_device_registration_and_push_targeting(client):
+    device = str(uuid.uuid4())
+    r = client.put("/api/devices", headers={"X-Device-Id": device}, json={"push_token": "tok-1", "platform": "android",
+               "notify_info": True, "only_nearby": True, "latitude": -20.16234, "longitude": 57.50187})
+    assert r.status_code == 200 and r.json()["push_server_configured"] is False
+    assert sql("select approx_lat::float, approx_lng::float from devices where push_token = 'tok-1'") == [(-20.16, 57.5)]
+    devices = [
+        {"push_token": "a", "notify_urgent": True, "only_nearby": False},
+        {"push_token": "b", "notify_urgent": False, "only_nearby": False},
+        {"push_token": "c", "notify_urgent": True, "only_nearby": True, "approx_lat": -20.16, "approx_lng": 57.50},
+        {"push_token": "d", "notify_urgent": True, "only_nearby": True, "approx_lat": -20.50, "approx_lng": 57.50},
+        {"push_token": None, "notify_urgent": True, "only_nearby": False},
+    ]
+    targets = select_targets(devices, {"severity": "urgent", "latitude": -20.17, "longitude": 57.51})
+    assert [d["push_token"] for d in targets] == ["a", "c"]
+    assert client.delete("/api/devices", headers={"X-Device-Id": device}).status_code == 204
+
+
+def test_cors_and_consistent_errors(client):
+    ok = client.options("/api/reports", headers={"Origin": "http://localhost:5174", "Access-Control-Request-Method": "POST",
+                                                  "Access-Control-Request-Headers": "x-device-id"})
+    assert ok.headers.get("access-control-allow-origin") == "http://localhost:5174"
+    bad = client.options("/api/reports", headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"})
+    assert "access-control-allow-origin" not in bad.headers
+    assert client.get("/api/nope").json()["error"]["code"] == "not_found"
+    assert client.get("/api/reports/not-a-uuid").json()["error"]["code"] == "validation_error"
+    assert client.get("/api/health").json() == {"status": "ok", "database": "ok"}
+    assert client.get("/").json()["status"] == "online"
